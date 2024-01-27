@@ -156,7 +156,7 @@ mod detail {
         mem::{size_of, transmute, MaybeUninit},
         num::NonZeroUsize,
         ptr::NonNull,
-        sync::atomic::{AtomicPtr, AtomicU32},
+        sync::atomic::{AtomicPtr, AtomicU32, Ordering},
     };
 
     use static_assertions::assert_eq_align;
@@ -292,6 +292,9 @@ mod detail {
         }
 
         fn allocate_page(&self, page_size: Option<NonZeroUsize>) {
+            // Actually, this lock isn't necessary for following logic to work. However, since the
+            // page allocation logic involves invocation of user-provided value initialization
+            // logic, which is unpredictable
             let _lc = self.alloc_lock.lock();
 
             let elem_count = page_size.unwrap_or(self.fallback_page_size).get();
@@ -343,7 +346,7 @@ mod detail {
             for (index, slot_ref) in payload_slice.iter_mut().enumerate() {
                 let slot_ptr = slot_ref as *mut MaybeUninit<Slot<T>>;
                 let slot_value = Slot::<T> {
-                    value: (self.init_func)(),
+                    value: (self.init_func)(), // TODO: Check panic behavior
 
                     // SAFETY:
                     // - We're going to initialize next element.
@@ -368,14 +371,50 @@ mod detail {
             // - And this step MUST not interfere `checkin` operations from different threads.
 
             // SAFETY: 1. Initialized, 2. Payload array length never be zero.
-            let last_elem = unsafe {
-                payload_slice
-                    .last_mut()
-                    .unwrap_unchecked()
-                    .assume_init_mut()
+            let (first_ptr, last_elem) = unsafe {
+                (
+                    payload_slice
+                        .first_mut()
+                        .unwrap_unchecked()
+                        .assume_init_mut() as *mut _,
+                    payload_slice
+                        .last_mut()
+                        .unwrap_unchecked()
+                        .assume_init_mut(),
+                )
             };
 
-            todo!()
+            // Preemptively increment both the total and free counts here. It's particularly
+            // important to increment the free count before inserting a new page into the stack, as
+            // failing to do so could reduce the free count below zero, potentially causing a panic
+            // or similar issue.
+            //
+            // Given that users may not expect an exact status for the free count in a multithreaded
+            // environment, adjusting the values here is unlikely to cause any issues.
+            self.item_counter.inc_total_by(elem_count);
+            self.item_counter.inc_free_item_by(elem_count);
+
+            // We're going to insert new allocations on top of the stack. Retried until succeed.
+            let mut cur_free_head = self.free_head.load(Ordering::Acquire);
+            loop {
+                // Connect the existing head to the newly created page's last element.
+                last_elem.next_free.store(cur_free_head, Ordering::Release);
+
+                // Attempt to update the free_head to point to the first element of the new page.
+                // If another thread has updated free_head, retry with the new value.
+                match self.free_head.compare_exchange_weak(
+                    cur_free_head,
+                    first_ptr,
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                ) {
+                    Ok(_) => break, // Successful update, exit loop.
+                    Err(new_cur) => {
+                        cur_free_head = new_cur; // Update current pointer and retry.
+                        continue;
+                    }
+                }
+            }
         }
 
         fn total_item(&self) -> Option<usize> {
