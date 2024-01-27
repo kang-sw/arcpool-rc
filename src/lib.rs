@@ -383,7 +383,7 @@ mod detail {
         }
 
         fn checkin(&self, ptr: NonNull<Slot<T>>) {
-            // TODO
+            // TODO: Decrement self's reference count.
 
             todo!()
         }
@@ -449,21 +449,24 @@ mod detail {
             // Increment strong count by 1, this MUST be synchronized
             Slot::add_ref(p_slot);
 
-            // Now
-
             // SAFETY: self is dereference of `Arc<Self>`.
             // - Additionaly, it is guaranteed that `Arc<Self>` is always valid, since we're calling
             //   THIS method thorugh the valid `Arc<Self>` reference!
             unsafe { Arc::increment_strong_count(self) };
+            //       ^^^ Single checkout == single strong reference to self.
         }
 
         fn mark_slot_checkout_local(&self, mut p_slot: NonNull<Slot<T>>) {
             // In this context, we have exclusive access to this value. And it is safe to deal with
-            // this value locally since we're currently
+            // this value locally since we're currently exclusively owning this slot!
 
             let slot = unsafe { p_slot.as_mut() };
+            debug_assert!(slot.weak_count == 0 && slot.generation.load(Ordering::Relaxed) == 0);
 
-            todo!()
+            Slot::add_ref_local(p_slot);
+
+            // SAFETY: same as above
+            unsafe { Arc::increment_strong_count(self) };
         }
 
         fn expand(&self) {
