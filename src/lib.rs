@@ -364,6 +364,63 @@ mod detail {
     /// Tries to pop the foremost slot from the given head socket. it'll return [`None`] when it
     /// eventually fails since there's no more elements to pop.
     fn try_pop_slot<T>(head: &AtomicPtr<Slot<T>>) -> Option<NonNull<Slot<T>>> {
+        let mut cur_head = head.load(Ordering::Acquire);
+
+        loop {
+            if cur_head.is_null() {
+                // No more elements to pop.
+                return None;
+            }
+
+            // SAFETY: `cur_head` is not null.
+            let next_head = unsafe { (*cur_head).next_free.load(Ordering::Acquire) };
+
+            // XXX: Should deal with the edge case
+            // - (1) -> (2) -> (3) -> (4)
+            //   - then [A] cache (2)
+            //   - then [B] cache (2), cmpxcg (1)
+            // - (2) -> (3) -> (4)
+            //   - then [C] cache (3), cmpxcg (2)
+            // - (3) -> (4)
+            //   - then [B] return (1), cmpxcg (3)
+            // - (1) -> (3) -> (4)
+            //   - FOR [A], (1) is identical ... but cached (2)
+            // - Now head is = (2:INVALID)
+            //   - A can detect this; (cache invalidated!)
+            //   - But, other thread still tries to access already allocated node 2.
+            //   - Need to avoid this situation ... but, how?
+
+            // Attempt to update the head to point to the next element. If another thread has
+            // updated the head, retry with the new value.
+            match head.compare_exchange_weak(
+                cur_head,
+                next_head,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => {
+                    // Clear out link to next node from current head.
+
+                    // SAFETY: This is guaranteed to be non-null
+                    unsafe {
+                        (*cur_head)
+                            .next_free
+                            .store(std::ptr::null_mut(), Ordering::Release);
+                    }
+
+                    // Successful update, exit loop.
+                    break Some(NonNull::new(cur_head).unwrap());
+                }
+                Err(new_cur) => {
+                    // Update current pointer and retry.
+                    cur_head = new_cur;
+                    continue;
+                }
+            }
+        }
+    }
+
+    fn push_slot<T>(head: &AtomicPtr<Slot<T>>, slot: NonNull<Slot<T>>) {
         todo!()
     }
 
@@ -513,7 +570,8 @@ mod detail {
             // We're going to insert new allocations on top of the stack. Retried until succeed.
             let mut cur_free_head = self.free_head.load(Ordering::Acquire);
             loop {
-                // Connect the existing head to the newly created page's last element.
+                // Connect the existing head to the newly created page's last element. This can be
+                // naively done since access to newly created page is exclusive for this thread.
                 last_elem.next_free.store(cur_free_head, Ordering::Release);
 
                 // Attempt to update the free_head to point to the first element of the new page.
