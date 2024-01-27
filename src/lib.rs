@@ -55,9 +55,15 @@ pub mod api {
         /// Therefore, if you use this method to 'reserve free space' repeatedly, similar to the
         /// approach in [`Vec`] families, it may result in continuously expanding memory usage.
         ///
-        /// Number of
+        /// Number of allocations cannot exceed (2^32 - 3)
         pub fn allocate_page(&self, page_size: impl TryInto<NonZeroUsize>) {
             self.inner.allocate_page(page_size.try_into().ok());
+        }
+
+        pub fn downgrade(&self) -> WeakPool<T> {
+            WeakPool {
+                inner: Arc::downgrade(&self.inner),
+            }
         }
     }
 
@@ -139,7 +145,6 @@ pub mod api {
     /// Pool item for non-weak items.
     pub struct WeakLocalPoolItem<T> {
         slot: NonNull<Slot<T>>,
-        gen: u32,
     }
 
     // ========================================================== *Partial* API ===|
@@ -162,8 +167,6 @@ mod detail {
     use static_assertions::assert_eq_align;
 
     pub(crate) mod pool {
-        use parking_lot::lock_api::RawMutex;
-
         #[derive(Default)]
         pub struct Builder<T, CreateFn, PrepareFn, CleanFn> {
             _marker_ty: std::marker::PhantomData<T>,
@@ -183,14 +186,20 @@ mod detail {
         // ==== Builder Component: Page Lock ====
         impl super::PageLock for () {
             type LockGuard<'a> = ();
-            fn lock(&self) -> Self::LockGuard<'_> {}
+            fn acquire_job(&self) -> Self::LockGuard<'_> {}
+            fn try_acquire_job(&self) -> Option<Self::LockGuard<'_>> {
+                Some(())
+            }
         }
 
         impl super::PageLock for parking_lot::Mutex<()> {
             type LockGuard<'a> = parking_lot::MutexGuard<'a, ()>;
 
-            fn lock(&self) -> Self::LockGuard<'_> {
+            fn acquire_job(&self) -> Self::LockGuard<'_> {
                 self.lock()
+            }
+            fn try_acquire_job(&self) -> Option<Self::LockGuard<'_>> {
+                self.try_lock()
             }
         }
 
@@ -240,7 +249,8 @@ mod detail {
         where
             Self: 'a;
 
-        fn lock(&self) -> Self::LockGuard<'_>;
+        fn acquire_job(&self) -> Self::LockGuard<'_>;
+        fn try_acquire_job(&self) -> Option<Self::LockGuard<'_>>;
     }
 
     trait Counter: 'static + Send + Sync {
@@ -248,7 +258,7 @@ mod detail {
         fn inc_free_item_by(&self, free: usize);
         fn dec_free_item_by(&self, free: usize);
 
-        fn total(&self) -> Option<usize>;
+        fn total_item(&self) -> Option<usize>;
         fn free_item(&self) -> Option<usize>;
     }
 
@@ -284,19 +294,125 @@ mod detail {
         AllocLock: PageLock,
     {
         fn checkout(&self) -> NonNull<Slot<T>> {
-            todo!()
+            loop {
+                // When *sync-mode* references are returned to `free_head_may_weak` with any
+                // remaining weak references alive, and if the pool is also used with *local-mode*
+                // references that only search for references in the `free_head` stack, there can be
+                // a starvation issue. This happens because *sync-mode* references, when checked in
+                // with an alive weak reference, continuously consume and return slots to
+                // `free_head_may_weak`. As a result, local-mode checkouts might suffer from a lack
+                // of available references in `free_head`.
+                //
+                // To prevent this situation, even if the user doesn't create any weak sync
+                // references, (as there's no cheap way to check if really weak sync is not used) we
+                // prioritize checking the weak stack first for *sync-mode* checkouts.
+                if let Some(slot) = try_pop_slot(&self.free_head_may_weak) {
+                    self.mark_slot_checkout(slot, true);
+                    break slot;
+                }
+
+                // If there are no available references in the weak stack, we then check all the
+                // stacks.
+                if let Some(slot) = try_pop_slot(&self.free_head) {
+                    self.mark_slot_checkout(slot, false);
+                    break slot;
+                }
+
+                // No slots are available here; additional pages need to be allocated.
+                self.expand();
+            }
         }
 
         fn checkout_local(&self) -> NonNull<Slot<T>> {
-            todo!()
+            loop {
+                // In local case, we don't care whether there's weak reference or not. This is
+                // because local reference is only released when both of strong and weak reference
+                // are released.
+                if let Some(slot) = try_pop_slot(&self.free_head) {
+                    self.mark_slot_checkout_local(slot);
+                    break slot;
+                }
+
+                // It's completely same routine with checkout().
+                self.expand();
+            }
         }
 
         fn allocate_page(&self, page_size: Option<NonZeroUsize>) {
-            // Actually, this lock isn't necessary for following logic to work. However, since the
-            // page allocation logic involves invocation of user-provided value initialization
-            // logic, which is unpredictable
-            let _lc = self.alloc_lock.lock();
+            // It does not lock for intent; since page allocation occurs due to explicit user
+            // request, it does not need to be bottlenecked.
+            self.allocate_page_impl(page_size);
+        }
 
+        fn total_item(&self) -> Option<usize> {
+            self.item_counter.total_item()
+        }
+
+        fn free_item(&self) -> Option<usize> {
+            self.item_counter.free_item()
+        }
+
+        fn checkin(&self, ptr: NonNull<Slot<T>>) {
+            todo!()
+        }
+
+        fn checkin_local(&self, ptr: NonNull<Slot<T>>) {
+            todo!()
+        }
+    }
+
+    /// Tries to pop the foremost slot from the given head socket. it'll return [`None`] when it
+    /// eventually fails since there's no more elements to pop.
+    fn try_pop_slot<T>(head: &AtomicPtr<Slot<T>>) -> Option<NonNull<Slot<T>>> {
+        todo!()
+    }
+
+    impl<T, CreateFn, PrepareFn, CleanFn, Cnt, AllocLock>
+        PoolInnerImpl<T, CreateFn, PrepareFn, CleanFn, Cnt, AllocLock>
+    where
+        T: 'static,
+        CreateFn: Fn() -> T + Send + Sync + 'static,
+        PrepareFn: ApplyFunc<T>,
+        CleanFn: ApplyFunc<T>,
+        Cnt: Counter,
+        AllocLock: PageLock,
+    {
+        fn mark_slot_checkout(&self, slot: NonNull<Slot<T>>, has_expired_weak: bool) {
+            // In this context, we have exclusive *STRONG* access to this value.
+
+            todo!()
+        }
+
+        fn mark_slot_checkout_local(&self, slot: NonNull<Slot<T>>) {
+            // In this context, we have exclusive access to this value.
+
+            todo!()
+        }
+
+        fn expand(&self) {
+            if let Some(_job) = self.alloc_lock.try_acquire_job() {
+                // TODO: Move this to the doc comment of builder.
+
+                // Acquiring this lock isn't mandatory for page allocation, but it's
+                // recommended. The allocation process involves executing user-provided
+                // initialization logic, which can have unpredictable execution time.
+                //
+                // Without the lock, multiple threads might concurrently see empty free element
+                // stacks and overallocate pages. Although this results in excessive memory
+                // allocation, all 'extra' allocations will be added to the free list
+                // effectively. Moreover, the user-provided initialization logic will run
+                // concurrently in this scenario. Thus, disabling the allocation lock can be a
+                // valid policy if extensive capacity expansion is preferred.
+                self.allocate_page_impl(None);
+            } else {
+                // Wait for another thread that has acquired the job handle to complete its
+                // work.
+                self.alloc_lock.acquire_job();
+            }
+        }
+
+        /// Actual allocation logic
+        fn allocate_page_impl(&self, page_size: Option<NonZeroUsize>) {
             let elem_count = page_size.unwrap_or(self.fallback_page_size).get();
             let slot_size = size_of::<Slot<T>>();
 
@@ -415,37 +531,6 @@ mod detail {
                     }
                 }
             }
-        }
-
-        fn total_item(&self) -> Option<usize> {
-            todo!()
-        }
-
-        fn free_item(&self) -> Option<usize> {
-            todo!()
-        }
-
-        fn checkin(&self, ptr: NonNull<Slot<T>>) {
-            todo!()
-        }
-
-        fn checkin_local(&self, ptr: NonNull<Slot<T>>) {
-            todo!()
-        }
-    }
-
-    impl<T, CreateFn, PrepareFn, CleanFn, Cnt, AllocLock>
-        PoolInnerImpl<T, CreateFn, PrepareFn, CleanFn, Cnt, AllocLock>
-    where
-        T: 'static,
-        CreateFn: ApplyFunc<T>,
-        PrepareFn: ApplyFunc<T>,
-        CleanFn: ApplyFunc<T>,
-        Cnt: Counter,
-        AllocLock: PageLock,
-    {
-        fn return_to_head(&self, ptr: NonNull<Slot<T>>) {
-            todo!()
         }
     }
 
