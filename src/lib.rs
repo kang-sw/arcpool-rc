@@ -158,10 +158,13 @@ pub mod api {
 
 mod detail {
     use std::{
-        mem::{replace, size_of, transmute, MaybeUninit},
+        mem::{replace, size_of, transmute, zeroed, MaybeUninit},
         num::NonZeroUsize,
-        ptr::NonNull,
-        sync::atomic::{AtomicPtr, AtomicU32, Ordering},
+        ptr::{null_mut, NonNull},
+        sync::{
+            atomic::{AtomicPtr, AtomicU32, Ordering},
+            Arc,
+        },
     };
 
     use parking_lot::Mutex;
@@ -246,12 +249,12 @@ mod detail {
         //   - A can detect this; (cache invalidated!)
         //   - But, other thread still tries to access already allocated node 2.
         //   - Need to avoid this situation ... but, how?
-        free_head: Mutex<*const Slot<T>>,
+        free_head: Mutex<*mut Slot<T>>,
 
         /// If only the strong reference was released (in sync) (i.e. any weak reference presents),
         /// the node will be stored here. Only `sync` checkouts are allowed to access this storage,
         /// as the generation based hot reuse is exclusively permitted for atomic versions.
-        free_head_may_weak: Mutex<*const Slot<T>>,
+        free_head_may_weak: Mutex<*mut Slot<T>>,
 
         fallback_page_size: NonZeroUsize,
 
@@ -380,40 +383,41 @@ mod detail {
         }
 
         fn checkin(&self, ptr: NonNull<Slot<T>>) {
+            // TODO
+
             todo!()
         }
 
         fn checkin_local(&self, ptr: NonNull<Slot<T>>) {
+            // TODO: Sync memory barrier of weak, strong count.
+
             todo!()
         }
     }
 
     /// Tries to pop the foremost slot from the given head socket. it'll return [`None`] when it
     /// eventually fails since there's no more elements to pop.
-    fn try_pop_slot<T>(head: &Mutex<*const Slot<T>>) -> Option<NonNull<Slot<T>>> {
+    fn try_pop_slot<T>(head: &Mutex<*mut Slot<T>>) -> Option<NonNull<Slot<T>>> {
         let mut head = head.lock();
 
-        let new_head = unsafe {
-            head.as_ref()?
-                .next_free
-                .swap(std::ptr::null_mut(), Ordering::Relaxed)
-        };
+        unsafe {
+            let new_head = head.as_mut()?.next_free;
+            let popped = replace(&mut *head, new_head);
 
-        Some(unsafe { NonNull::new_unchecked(replace(&mut *head, new_head) as _) })
+            drop(head); // Drops lock early as possible.
+            (*popped).next_free = null_mut();
+
+            Some(NonNull::new_unchecked(popped))
+        }
     }
 
-    fn push_slot<T>(head: &Mutex<*const Slot<T>>, mut slot: NonNull<Slot<T>>) {
+    fn push_slot<T>(head: &Mutex<*mut Slot<T>>, mut slot: NonNull<Slot<T>>) {
         let mut head = head.lock();
 
         // Next element MUST be free
-        debug_assert!(unsafe { slot.as_ref() }
-            .next_free
-            .load(Ordering::Relaxed)
-            .is_null());
+        debug_assert!(unsafe { slot.as_ref() }.next_free.is_null());
 
-        unsafe { slot.as_mut() }
-            .next_free
-            .store(*head as _, Ordering::Relaxed);
+        unsafe { slot.as_mut() }.next_free = *head;
 
         *head = slot.as_ptr();
     }
@@ -428,14 +432,36 @@ mod detail {
         Cnt: Counter,
         AllocLock: PageLock,
     {
-        fn mark_slot_checkout(&self, slot: NonNull<Slot<T>>, has_expired_weak: bool) {
+        fn mark_slot_checkout(&self, mut p_slot: NonNull<Slot<T>>, has_weak: bool) {
             // In this context, we have exclusive *STRONG* access to this value.
 
-            todo!()
+            let slot = unsafe { p_slot.as_mut() };
+
+            // If it has weak count, we can't guarantee that it's larger than 0. However, in
+            // opposite case, the weak count and the generation MUST be zero.
+            debug_assert!(
+                has_weak || (slot.weak_count == 0 && slot.generation.load(Ordering::Relaxed) == 0)
+            );
+
+            // Before giving it a strong reference count, increment generation by 1.
+            slot.generation.fetch_add(1, Ordering::Relaxed);
+
+            // Increment strong count by 1, this MUST be synchronized
+            Slot::add_ref(p_slot);
+
+            // Now
+
+            // SAFETY: self is dereference of `Arc<Self>`.
+            // - Additionaly, it is guaranteed that `Arc<Self>` is always valid, since we're calling
+            //   THIS method thorugh the valid `Arc<Self>` reference!
+            unsafe { Arc::increment_strong_count(self) };
         }
 
-        fn mark_slot_checkout_local(&self, slot: NonNull<Slot<T>>) {
-            // In this context, we have exclusive access to this value.
+        fn mark_slot_checkout_local(&self, mut p_slot: NonNull<Slot<T>>) {
+            // In this context, we have exclusive access to this value. And it is safe to deal with
+            // this value locally since we're currently
+
+            let slot = unsafe { p_slot.as_mut() };
 
             todo!()
         }
@@ -474,11 +500,20 @@ mod detail {
             // Alignment of `Slot` must be larger than `PageHeader`. This is ALWAYS true as long as
             // following assertion is satisfied; as `PageHeader` never aligned to other than pointer
             // size.
-            assert_eq_align!(PageHeader<()>, Slot<()>);
-            assert_eq_align!(PageHeader<u8>, Slot<u8>);
-            assert_eq_align!(PageHeader<u16>, Slot<u16>);
-            assert_eq_align!(PageHeader<u32>, Slot<u32>);
-            assert_eq_align!(PageHeader<*const ()>, Slot<*const ()>);
+            macro_rules! check_align_size {
+                ($t:ty) => {
+                    static_assertions::const_assert!(
+                        std::mem::align_of::<PageHeader<$t>>() <= std::mem::align_of::<Slot<$t>>()
+                    )
+                };
+            }
+
+            check_align_size!(());
+            check_align_size!(u8);
+            check_align_size!(u16);
+            check_align_size!(u32);
+            check_align_size!(u64);
+            check_align_size!(u128);
 
             let buffer = {
                 let mut v = Vec::<MaybeUninit<Slot<T>>>::new();
@@ -516,10 +551,10 @@ mod detail {
                     value: (self.init_func)(), // TODO: Check panic behavior
 
                     // SAFETY:
-                    // - We're going to initialize next element.
+                    // - For 0..end-1 elems, its not yet initialized, but we'll.
                     // - For last element which points to invalid memory space, will be handled
                     //   after breaking out of this loop.
-                    next_free: AtomicPtr::new(unsafe { transmute(slot_ptr.add(1)) }),
+                    next_free: unsafe { transmute(slot_ptr.add(1)) },
 
                     generation: AtomicU32::new(0),
                     strong_count: 0,
@@ -561,8 +596,9 @@ mod detail {
             self.item_counter.inc_total_by(elem_count);
             self.item_counter.inc_free_item_by(elem_count);
 
-            // We're going to insert new allocations on top of the stack. Retried until succeed.
-            let free_head = self.free_head.lock();
+            // Insert created page to stack
+            let mut free_head = self.free_head.lock();
+            last_elem.next_free = *free_head;
         }
     }
 
@@ -595,7 +631,7 @@ mod detail {
     /// A container for single value.
     pub(crate) struct Slot<T> {
         value: T,
-        next_free: AtomicPtr<Slot<T>>,
+        next_free: *mut Slot<T>,
 
         /// # Concept of Generation and Weak Count
         ///
@@ -641,12 +677,11 @@ mod detail {
 
     impl<T> Slot<T> {
         // ==== Local API ====
-
-        pub fn release_local(this: NonNull<Self>) {
+        pub fn add_ref_local(this: NonNull<Self>) {
             todo!()
         }
 
-        pub fn add_ref_local(this: NonNull<Self>) {
+        pub fn release_local(this: NonNull<Self>) {
             todo!()
         }
 
