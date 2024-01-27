@@ -8,6 +8,7 @@ license = "MIT"
 
 [dependencies]
 parking_lot = "0.12.1"
+static_assertions = "1.1.0"
 
 [features]
 force-safe-api = []
