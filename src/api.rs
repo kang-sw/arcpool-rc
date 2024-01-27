@@ -82,12 +82,12 @@ where
 
 // ========================================================== Pool Item ===|
 
-pub struct PoolItem<T> {
+pub struct PoolItem<T: 'static> {
     slot: NonNull<Slot<T>>,
 }
 
-pub struct WeakPoolItem<T> {
-    slot: NonNull<Slot<T>>,
+pub struct WeakPoolItem<T: 'static> {
+    slot: Option<NonNull<Slot<T>>>,
     gen: u32,
 }
 
@@ -118,19 +118,30 @@ impl<T: 'static + Send + Sync> WeakPoolItem<T> {
 
 impl<T: 'static + Send + Sync> Clone for PoolItem<T> {
     fn clone(&self) -> Self {
-        todo!()
+        // Since we're already holding a strong reference, it's okay to add reference at any moment.
+        Slot::add_ref(self.slot);
+
+        Self { slot: self.slot }
     }
 }
 
 impl<T: 'static + Send + Sync> Clone for WeakPoolItem<T> {
     fn clone(&self) -> Self {
-        todo!()
+        Self {
+            gen: self.gen,
+
+            // We conditionally clone only if it's not expired. This is not to create expired
+            // reference repeatedly, which simply delays release of reusable memory space.
+            slot: self
+                .slot
+                .and_then(|slot| Slot::weak_add_ref(slot, self.gen)),
+        }
     }
 }
 
 impl<T> Drop for PoolItem<T> {
     fn drop(&mut self) {
-        todo!()
+        Slot::release(self.slot)
     }
 }
 
@@ -138,13 +149,15 @@ impl<T> std::ops::Deref for PoolItem<T> {
     type Target = T;
 
     fn deref(&self) -> &Self::Target {
-        todo!()
+        Slot::deref(self.slot)
     }
 }
 
 impl<T> Drop for WeakPoolItem<T> {
     fn drop(&mut self) {
-        Slot::release(self.slot)
+        if let Some(slot) = self.slot {
+            Slot::release(slot)
+        }
     }
 }
 

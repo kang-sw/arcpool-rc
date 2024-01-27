@@ -56,11 +56,13 @@ pub(crate) trait PoolInner<T>: Send + Sync + 'static {
 
     fn allocate_page(&self, page_size: Option<NonZeroUsize>);
 
-    fn total_item(&self) -> Option<usize>;
-    fn free_item(&self) -> Option<usize>;
+    fn num_total_items(&self) -> Option<usize>;
+    fn num_free_items(&self) -> Option<usize>;
 
     fn checkin(&self, ptr: NonNull<Slot<T>>);
+    fn free_slot(&self, ptr: NonNull<Slot<T>>);
     fn checkin_local(&self, ptr: NonNull<Slot<T>>);
+    fn free_slot_local(&self, ptr: NonNull<Slot<T>>);
 }
 
 // ========================================================== Pool Inner Impl ===|
@@ -126,7 +128,7 @@ trait PageLock: 'static + Send + Sync {
 trait Counter: 'static + Send + Sync {
     fn inc_total_by(&self, total: usize);
     fn inc_free_item_by(&self, free: usize);
-    fn dec_free_item_by(&self, free: usize);
+    fn dec_free_item(&self);
 
     fn total_item(&self) -> Option<usize>;
     fn free_item(&self) -> Option<usize>;
@@ -223,25 +225,35 @@ where
         self.allocate_page_impl(page_size);
     }
 
-    fn total_item(&self) -> Option<usize> {
+    fn num_total_items(&self) -> Option<usize> {
         self.item_counter.total_item()
     }
 
-    fn free_item(&self) -> Option<usize> {
+    fn num_free_items(&self) -> Option<usize> {
         self.item_counter.free_item()
     }
 
     fn checkin(&self, ptr: NonNull<Slot<T>>) {
-        // TODO: Decrement self's reference count.
+        self.item_counter.inc_free_item_by(1);
+
+        todo!("All strong reference released")
+    }
+
+    fn checkin_local(&self, ptr: NonNull<Slot<T>>) {
+        self.item_counter.inc_free_item_by(1);
+
+        // TODO: Sync memory barrier of weak, strong count. Prepare to put this node to free stack.
 
         todo!()
     }
 
-    fn checkin_local(&self, ptr: NonNull<Slot<T>>) {
-        // TODO: Sync memory barrier of weak, strong count.
-
+    fn free_slot(&self, ptr: NonNull<Slot<T>>) {
         // TODO: Decrement self's reference count.
+        todo!("Slot is completely freed")
+    }
 
+    fn free_slot_local(&self, ptr: NonNull<Slot<T>>) {
+        // TODO: Decrement self's reference count.
         todo!()
     }
 }
@@ -282,6 +294,8 @@ where
     AllocLock: PageLock,
 {
     fn mark_slot_checkout(&self, mut p_slot: NonNull<Slot<T>>, has_weak: bool) {
+        self.item_counter.dec_free_item();
+
         // In this context, we have exclusive *STRONG* access to this value.
 
         let slot = unsafe { p_slot.as_mut() };
@@ -336,6 +350,8 @@ where
     }
 
     fn mark_slot_checkout_local(&self, mut p_slot: NonNull<Slot<T>>) {
+        self.item_counter.dec_free_item();
+
         // In this context, we have exclusive access to this value. And it is safe to deal with
         // this value locally since we're currently exclusively owning this slot!
 
@@ -524,27 +540,27 @@ pub(crate) struct Slot<T> {
 
     /// # Concept of Generation and Weak Count
     ///
-    /// To enable the coexistence of expired weak references with new allocations in the same
-    /// slot, a generation value is introduced, tied to the strong count. The strong reference
-    /// operates as usual (atomically adding/removing reference count, as long as the total
-    /// number of strong counts is less than 2^32-1). However, the weak reference's upgrade
-    /// operation differs from the normal [`std::sync::Arc`] behavior.
+    /// To enable the coexistence of expired weak references with new allocations in the same slot,
+    /// a generation value is introduced, tied to the strong count. The strong reference operates as
+    /// usual (atomically adding/removing reference count, as long as the total number of strong
+    /// counts is less than 2^32-1). However, the weak reference's upgrade operation differs from
+    /// the normal [`std::sync::Arc`] behavior.
     ///
     /// Once all strong references to a slot expire, a weak reference can no longer upgrade its
     /// reference since the strong reference count is 0, regardless of its generation.
     ///
-    /// Then, with every new allocation of a slot, the generation value is incremented by 1
-    /// before increasing its strong reference count. Subsequently, any upgrade request from a
-    /// weak reference will be rejected if the generation values mismatch, even if the strong
-    /// count is non-zero.
+    /// Then, with every new allocation of a slot, the generation value is incremented by 1 before
+    /// increasing its strong reference count. Subsequently, any upgrade request from a weak
+    /// reference will be rejected if the generation values mismatch, even if the strong count is
+    /// non-zero.
     ///
     /// This method allows for the safe reuse of memory blocks held by alive weak references.
     ///
     /// # Warning
     ///
-    /// There is a single caveat to be aware of: With every 2^32 reallocations of the same slot,
-    /// the generation value may cycle, potentially validating the dead weak references of
-    /// existing handles.
+    /// There is a single caveat to be aware of: With every 2^32 reallocations of the same slot, the
+    /// generation value may cycle, potentially validating the dead weak references of existing
+    /// handles.
     ///
     /// These might be silently upgraded to valid strong references, which is likely unintended.
     ///
@@ -553,8 +569,17 @@ pub(crate) struct Slot<T> {
     ///
     /// ---
     ///
-    /// In local case, it does not care generation as local reference is only released when both
-    /// of strong and weak reference are freed. This is since we can't guarantee that
+    /// In the case of local references, generation is not a concern since a local reference is only
+    /// released when both strong and weak references are freed. This approach is adopted because
+    /// even if a reference is local, it can potentially be checked out to another thread, where it
+    /// remains local. In such scenarios, two different threads may naively manipulate the same weak
+    /// reference count in a non-atomic manner.
+    ///
+    /// Implementing every weak count operation to support the local, atomic case may seem
+    /// excessive. (To ensure robust behavior in this context, we might need to use thread-local
+    /// storage or a similar mechanism, considering that the pool itself operates in a
+    /// multi-threaded environment)
+    ///
     generation: AtomicU32,
     strong_count: u32,
     weak_count: u32,
@@ -564,7 +589,7 @@ pub(crate) struct Slot<T> {
     index_offset: u32,
 }
 
-impl<T> Slot<T> {
+impl<T: 'static> Slot<T> {
     pub unsafe fn as_atomic_strong(&mut self) -> &AtomicU32 {
         AtomicU32::from_ptr(&mut self.strong_count)
     }
@@ -574,25 +599,48 @@ impl<T> Slot<T> {
     }
 
     // ==== Local API ====
-    pub fn add_ref_local(this: NonNull<Self>) {
-        todo!()
+    pub fn add_ref_local(mut this: NonNull<Self>) {
+        Self::access_mut(&mut this).strong_count += 1;
     }
 
-    pub fn release_local(this: NonNull<Self>) {
-        todo!()
+    pub fn release_local(p_this: NonNull<Self>) {
+        let mut p_this_b = p_this; // Just workaround to avoid borrow checker complaint
+        let this = Self::access_mut(&mut p_this_b);
+
+        this.strong_count -= 1;
+        if this.strong_count > 0 {
+            return;
+        }
+
+        // Request checking out the item.
+        this.owner().checkin_local(p_this);
+
+        // Decrement single weak reference initially incurred by strong references.
+        Self::weak_release_local(p_this);
     }
 
     pub fn weak_add_ref_local(this: NonNull<Self>) {
         todo!()
     }
 
-    pub fn weak_release_local(this: NonNull<Self>, gen: u32) {
-        todo!()
+    pub fn weak_release_local(p_this: NonNull<Self>) {
+        let mut p_this_b = p_this; // Just workaround to avoid borrow checker complaint
+        let this = Self::access_mut(&mut p_this_b);
+
+        this.weak_count -= 1;
+        if this.weak_count > 0 {
+            return;
+        }
+
+        this.owner().free_slot_local(p_this);
     }
 
     // ==== Sync API ====
 
-    pub fn add_ref(this: NonNull<Self>) {
+    pub fn add_ref(this: NonNull<Self>)
+    where
+        T: Send + Sync,
+    {
         todo!()
     }
 
@@ -601,7 +649,7 @@ impl<T> Slot<T> {
     }
 
     /// Adding ref does not care whether
-    pub fn weak_add_ref(this: NonNull<Self>) {
+    pub fn weak_add_ref(this: NonNull<Self>, gen: u32) -> Option<NonNull<Self>> {
         todo!()
     }
 
@@ -617,7 +665,33 @@ impl<T> Slot<T> {
         todo!()
     }
 
+    pub fn deref<'a>(this: NonNull<Self>) -> &'a T {
+        todo!()
+    }
+
+    pub fn try_mut<'a>(this: NonNull<Self>) -> Option<&'a mut T> {
+        todo!()
+    }
+
+    // ==== Accessors ====
+
+    #[inline]
+    fn access(this: &NonNull<Self>) -> &Self {
+        // SAFETY: using with caution 🤔
+        unsafe { this.as_ref() }
+    }
+
+    #[inline]
+    fn access_mut(this: &mut NonNull<Self>) -> &mut Self {
+        // SAFETY: using with caution 🤔
+        unsafe { this.as_mut() }
+    }
+
     fn header(&self) -> NonNull<PageHeader<T>> {
+        todo!()
+    }
+
+    fn owner(&self) -> &dyn PoolInner<T> {
         todo!()
     }
 }
