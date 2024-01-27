@@ -158,12 +158,13 @@ pub mod api {
 
 mod detail {
     use std::{
-        mem::{size_of, transmute, MaybeUninit},
+        mem::{replace, size_of, transmute, MaybeUninit},
         num::NonZeroUsize,
         ptr::NonNull,
         sync::atomic::{AtomicPtr, AtomicU32, Ordering},
     };
 
+    use parking_lot::Mutex;
     use static_assertions::assert_eq_align;
 
     pub(crate) mod pool {
@@ -222,12 +223,35 @@ mod detail {
     // ========================================================== Pool Inner Impl ===|
 
     struct PoolInnerImpl<T, CreateFn, PrepareFn, CleanFn, Counter, AllocLock> {
-        free_head: AtomicPtr<Slot<T>>,
+        /// # XXX
+        ///
+        /// Since the lock-free implementation of this logic is overly complicated and hard to
+        /// verify whether it's correctly written or not, just use mutex here. In future, if I
+        /// become more advanced to concurrency, then reconsider lock-free implementation again ...
+        ///
+        // The lock-free implementation should deal with the edge case. Maybe we can adopt slot-wise
+        // locks, however, how it differs from this *verified* mutex if it needed to be checked
+        // everytime?
+        //
+        // - (1) -> (2) -> (3) -> (4)
+        //   - then [A] cache (2)
+        //   - then [B] cache (2), cmpxcg (1)
+        // - (2) -> (3) -> (4)
+        //   - then [C] cache (3), cmpxcg (2)
+        // - (3) -> (4)
+        //   - then [B] return (1), cmpxcg (3)
+        // - (1) -> (3) -> (4)
+        //   - FOR [A], (1) is identical ... but cached (2)
+        // - Now head is = (2:INVALID)
+        //   - A can detect this; (cache invalidated!)
+        //   - But, other thread still tries to access already allocated node 2.
+        //   - Need to avoid this situation ... but, how?
+        free_head: Mutex<*const Slot<T>>,
 
         /// If only the strong reference was released (in sync) (i.e. any weak reference presents),
         /// the node will be stored here. Only `sync` checkouts are allowed to access this storage,
         /// as the generation based hot reuse is exclusively permitted for atomic versions.
-        free_head_may_weak: AtomicPtr<Slot<T>>,
+        free_head_may_weak: Mutex<*const Slot<T>>,
 
         fallback_page_size: NonZeroUsize,
 
@@ -239,6 +263,9 @@ mod detail {
 
         item_counter: Counter,
     }
+
+    unsafe impl<T1, T2, T3, T4, T5, T6> Send for PoolInnerImpl<T1, T2, T3, T4, T5, T6> {}
+    unsafe impl<T1, T2, T3, T4, T5, T6> Sync for PoolInnerImpl<T1, T2, T3, T4, T5, T6> {}
 
     trait ApplyFunc<T>: 'static + Send + Sync {
         fn clean(&self, _: &mut T);
@@ -363,65 +390,32 @@ mod detail {
 
     /// Tries to pop the foremost slot from the given head socket. it'll return [`None`] when it
     /// eventually fails since there's no more elements to pop.
-    fn try_pop_slot<T>(head: &AtomicPtr<Slot<T>>) -> Option<NonNull<Slot<T>>> {
-        let mut cur_head = head.load(Ordering::Acquire);
+    fn try_pop_slot<T>(head: &Mutex<*const Slot<T>>) -> Option<NonNull<Slot<T>>> {
+        let mut head = head.lock();
 
-        loop {
-            if cur_head.is_null() {
-                // No more elements to pop.
-                return None;
-            }
+        let new_head = unsafe {
+            head.as_ref()?
+                .next_free
+                .swap(std::ptr::null_mut(), Ordering::Relaxed)
+        };
 
-            // SAFETY: `cur_head` is not null.
-            let next_head = unsafe { (*cur_head).next_free.load(Ordering::Acquire) };
-
-            // XXX: Should deal with the edge case
-            // - (1) -> (2) -> (3) -> (4)
-            //   - then [A] cache (2)
-            //   - then [B] cache (2), cmpxcg (1)
-            // - (2) -> (3) -> (4)
-            //   - then [C] cache (3), cmpxcg (2)
-            // - (3) -> (4)
-            //   - then [B] return (1), cmpxcg (3)
-            // - (1) -> (3) -> (4)
-            //   - FOR [A], (1) is identical ... but cached (2)
-            // - Now head is = (2:INVALID)
-            //   - A can detect this; (cache invalidated!)
-            //   - But, other thread still tries to access already allocated node 2.
-            //   - Need to avoid this situation ... but, how?
-
-            // Attempt to update the head to point to the next element. If another thread has
-            // updated the head, retry with the new value.
-            match head.compare_exchange_weak(
-                cur_head,
-                next_head,
-                Ordering::AcqRel,
-                Ordering::Acquire,
-            ) {
-                Ok(_) => {
-                    // Clear out link to next node from current head.
-
-                    // SAFETY: This is guaranteed to be non-null
-                    unsafe {
-                        (*cur_head)
-                            .next_free
-                            .store(std::ptr::null_mut(), Ordering::Release);
-                    }
-
-                    // Successful update, exit loop.
-                    break Some(NonNull::new(cur_head).unwrap());
-                }
-                Err(new_cur) => {
-                    // Update current pointer and retry.
-                    cur_head = new_cur;
-                    continue;
-                }
-            }
-        }
+        Some(unsafe { NonNull::new_unchecked(replace(&mut *head, new_head) as _) })
     }
 
-    fn push_slot<T>(head: &AtomicPtr<Slot<T>>, slot: NonNull<Slot<T>>) {
-        todo!()
+    fn push_slot<T>(head: &Mutex<*const Slot<T>>, mut slot: NonNull<Slot<T>>) {
+        let mut head = head.lock();
+
+        // Next element MUST be free
+        debug_assert!(unsafe { slot.as_ref() }
+            .next_free
+            .load(Ordering::Relaxed)
+            .is_null());
+
+        unsafe { slot.as_mut() }
+            .next_free
+            .store(*head as _, Ordering::Relaxed);
+
+        *head = slot.as_ptr();
     }
 
     impl<T, CreateFn, PrepareFn, CleanFn, Cnt, AllocLock>
@@ -568,27 +562,7 @@ mod detail {
             self.item_counter.inc_free_item_by(elem_count);
 
             // We're going to insert new allocations on top of the stack. Retried until succeed.
-            let mut cur_free_head = self.free_head.load(Ordering::Acquire);
-            loop {
-                // Connect the existing head to the newly created page's last element. This can be
-                // naively done since access to newly created page is exclusive for this thread.
-                last_elem.next_free.store(cur_free_head, Ordering::Release);
-
-                // Attempt to update the free_head to point to the first element of the new page.
-                // If another thread has updated free_head, retry with the new value.
-                match self.free_head.compare_exchange_weak(
-                    cur_free_head,
-                    first_ptr,
-                    Ordering::AcqRel,
-                    Ordering::Acquire,
-                ) {
-                    Ok(_) => break, // Successful update, exit loop.
-                    Err(new_cur) => {
-                        cur_free_head = new_cur; // Update current pointer and retry.
-                        continue;
-                    }
-                }
-            }
+            let free_head = self.free_head.lock();
         }
     }
 
