@@ -1,15 +1,14 @@
 use std::{
-    mem::{replace, size_of, transmute, zeroed, MaybeUninit},
+    mem::{replace, size_of, transmute, MaybeUninit},
     num::NonZeroUsize,
     ptr::{null_mut, NonNull},
     sync::{
-        atomic::{AtomicPtr, AtomicU32, Ordering},
+        atomic::{self, AtomicU32, Ordering},
         Arc,
     },
 };
 
 use parking_lot::Mutex;
-use static_assertions::assert_eq_align;
 
 pub(crate) mod pool {
     #[derive(Default)]
@@ -25,7 +24,7 @@ pub(crate) mod pool {
     // ==== Builder Component: Cleaner Function ====
 
     impl<T> super::ApplyFunc<T> for () {
-        fn clean(&self, _: &mut T) {}
+        fn call(&self, _: &mut T) {}
     }
 
     // ==== Builder Component: Page Lock ====
@@ -112,7 +111,7 @@ unsafe impl<T1, T2, T3, T4, T5, T6> Send for PoolInnerImpl<T1, T2, T3, T4, T5, T
 unsafe impl<T1, T2, T3, T4, T5, T6> Sync for PoolInnerImpl<T1, T2, T3, T4, T5, T6> {}
 
 trait ApplyFunc<T>: 'static + Send + Sync {
-    fn clean(&self, _: &mut T);
+    fn call(&self, _: &mut T);
 }
 
 trait PageLock: 'static + Send + Sync {
@@ -166,31 +165,38 @@ where
 {
     fn checkout(&self) -> NonNull<Slot<T>> {
         loop {
-            // When *sync-mode* references are returned to `free_head_may_weak` with any
-            // remaining weak references alive, and if the pool is also used with *local-mode*
-            // references that only search for references in the `free_head` stack, there can be
-            // a starvation issue. This happens because *sync-mode* references, when checked in
-            // with an alive weak reference, continuously consume and return slots to
-            // `free_head_may_weak`. As a result, local-mode checkouts might suffer from a lack
-            // of available references in `free_head`.
+            // When *sync-mode* references are returned to `free_head_may_weak` with any remaining
+            // weak references alive, and if the pool is also used with *local-mode* references that
+            // only search for references in the `free_head` stack, there can be a starvation issue.
+            // This happens because *sync-mode* references, when checked in with an alive weak
+            // reference, continuously consume and return slots to `free_head_may_weak`. As a
+            // result, local-mode checkouts might suffer from a lack of available references in
+            // `free_head`.
             //
-            // To prevent this situation, even if the user doesn't create any weak sync
-            // references, (as there's no cheap way to check if really weak sync is not used) we
-            // prioritize checking the weak stack first for *sync-mode* checkouts.
-            if let Some(slot) = try_pop_slot(&self.free_head_may_weak) {
-                self.mark_slot_checkout(slot, true);
-                break slot;
-            }
+            // To prevent this situation, even if the user doesn't create any weak sync references,
+            // (as there's no cheap way to check if really weak sync is not used) we prioritize
+            // checking the weak stack first for *sync-mode* checkouts.
+            //
+            // SAFETY:
+            //   * Access to `free_head` is exclusive as long as it's locked.
+            //   * Access to `free_head_may_weak` is possibly shared between "already expired" weak
+            //     references, however, they are guaranteed to not elevate/interfere slot jobs
+            unsafe {
+                if let Some(slot) = try_pop_slot(&self.free_head_may_weak) {
+                    self.mark_slot_checkout(slot, true);
+                    break slot;
+                }
 
-            // If there are no available references in the weak stack, we then check all the
-            // stacks.
-            if let Some(slot) = try_pop_slot(&self.free_head) {
-                self.mark_slot_checkout(slot, false);
-                break slot;
+                // If there are no available references in the weak stack, we then check all the
+                // stacks.
+                if let Some(slot) = try_pop_slot(&self.free_head) {
+                    self.mark_slot_checkout(slot, false);
+                    break slot;
+                }
             }
 
             // No slots are available here; additional pages need to be allocated.
-            self.expand();
+            self.expand_by_default();
         }
     }
 
@@ -199,13 +205,15 @@ where
             // In local case, we don't care whether there's weak reference or not. This is
             // because local reference is only released when both of strong and weak reference
             // are released.
-            if let Some(slot) = try_pop_slot(&self.free_head) {
+            //
+            // SAFETY: Same as above.
+            if let Some(slot) = unsafe { try_pop_slot(&self.free_head) } {
                 self.mark_slot_checkout_local(slot);
                 break slot;
             }
 
             // It's completely same routine with checkout().
-            self.expand();
+            self.expand_by_default();
         }
     }
 
@@ -232,24 +240,24 @@ where
     fn checkin_local(&self, ptr: NonNull<Slot<T>>) {
         // TODO: Sync memory barrier of weak, strong count.
 
+        // TODO: Decrement self's reference count.
+
         todo!()
     }
 }
 
 /// Tries to pop the foremost slot from the given head socket. it'll return [`None`] when it
 /// eventually fails since there's no more elements to pop.
-fn try_pop_slot<T>(head: &Mutex<*mut Slot<T>>) -> Option<NonNull<Slot<T>>> {
+unsafe fn try_pop_slot<T>(head: &Mutex<*mut Slot<T>>) -> Option<NonNull<Slot<T>>> {
     let mut head = head.lock();
 
-    unsafe {
-        let new_head = head.as_mut()?.next_free;
-        let popped = replace(&mut *head, new_head);
+    let new_head = head.as_mut()?.next_free;
+    let popped = replace(&mut *head, new_head);
 
-        drop(head); // Drops lock early as possible.
-        (*popped).next_free = null_mut();
+    drop(head); // Drops lock early as possible.
+    (*popped).next_free = null_mut();
 
-        Some(NonNull::new_unchecked(popped))
-    }
+    Some(NonNull::new_unchecked(popped))
 }
 
 fn push_slot<T>(head: &Mutex<*mut Slot<T>>, mut slot: NonNull<Slot<T>>) {
@@ -284,17 +292,47 @@ where
             has_weak || (slot.weak_count == 0 && slot.generation.load(Ordering::Relaxed) == 0)
         );
 
-        // Before giving it a strong reference count, increment generation by 1.
-        slot.generation.fetch_add(1, Ordering::Relaxed);
+        // Before giving it a strong reference count, increment generation by 1 whether it has weak
+        // reference or not. (it'll be 1 if there was no weak references)
+        //
+        // Memory order should be `release`, since if any expired weak reference present and it
+        // observes the strong reference count existance before the generation value change is
+        // observed, it will be upgraded to invalid strong reference.
 
-        // Increment strong count by 1, this MUST be synchronized
-        Slot::add_ref(p_slot);
+        // SAFETY: `weak_count` is guaranteed accessed as atomic as long as `has_weak` is true.
+        let no_alive_weak_ref =
+            !has_weak || (unsafe { slot.as_atomic_weak().fetch_add(1, Ordering::Acquire) } == 0);
+        //                ^^^ `has_weak` set to true if we fetched this entity from
+        //                `free_head_may_weak`, however, as its name implies, the dangling weak
+        //                reference possibly be resolved while it is free. Therefore, it's better to
+        //                double-check if this reference actually *has weak* count as advertised.
 
-        // SAFETY: self is dereference of `Arc<Self>`.
-        // - Additionaly, it is guaranteed that `Arc<Self>` is always valid, since we're calling
-        //   THIS method thorugh the valid `Arc<Self>` reference!
-        unsafe { Arc::increment_strong_count(self) };
-        //       ^^^ Single checkout == single strong reference to self.
+        if no_alive_weak_ref {
+            // We have exclusive
+            slot.generation = AtomicU32::new(1);
+            slot.weak_count = 1; // NOTE: See implementation of `Arc`
+            slot.strong_count = 1;
+
+            // SAFETY: self is dereference of `Arc<Self>`.
+            // - Additionaly, it is guaranteed that `Arc<Self>` is always valid, since we're calling
+            //   THIS method thorugh the valid `Arc<Self>` reference!
+            unsafe { Arc::increment_strong_count(self) }
+        } else {
+            // Let expired weak count observe new generation value before we modifying strong count.
+            slot.generation.fetch_add(1, Ordering::AcqRel);
+            slot.strong_count = 1; // It's okay to accessing it via non-atomic way, as the expired
+                                   // weak reference won't care the strong count value if generation
+                                   // value mismatches. Therefore the only guarantee that we should
+                                   // provide is generation is modified *before* strong count become
+                                   // any non-zero value, which is accomplished by `AcqRel` ordering
+
+            // We don't increment reference count of `self` here; since previous weak reference
+            // count was non-zero, which means the previous strong count increment is still
+            // remaining thus incrementing it again will leak the self reference forever.
+        }
+
+        // Now data is valid to access; prepare the data
+        self.prepare_func.call(&mut slot.value);
     }
 
     fn mark_slot_checkout_local(&self, mut p_slot: NonNull<Slot<T>>) {
@@ -304,13 +342,19 @@ where
         let slot = unsafe { p_slot.as_mut() };
         debug_assert!(slot.weak_count == 0 && slot.generation.load(Ordering::Relaxed) == 0);
 
+        // When the last strong reference dies, it decrements weak reference count either.
+        // Despawning the slot itself is the role of last weak reference.
         Slot::add_ref_local(p_slot);
+        Slot::weak_add_ref_local(p_slot);
 
-        // SAFETY: same as above
+        // SAFETY: self is dereference of `Arc<Self>`
         unsafe { Arc::increment_strong_count(self) };
+
+        // Now data is valid to access; prepare the data
+        self.prepare_func.call(&mut slot.value);
     }
 
-    fn expand(&self) {
+    fn expand_by_default(&self) {
         if let Some(_job) = self.alloc_lock.try_acquire_job() {
             // TODO: Move this to the doc comment of builder.
 
@@ -521,6 +565,14 @@ pub(crate) struct Slot<T> {
 }
 
 impl<T> Slot<T> {
+    pub unsafe fn as_atomic_strong(&mut self) -> &AtomicU32 {
+        AtomicU32::from_ptr(&mut self.strong_count)
+    }
+
+    pub unsafe fn as_atomic_weak(&mut self) -> &AtomicU32 {
+        AtomicU32::from_ptr(&mut self.weak_count)
+    }
+
     // ==== Local API ====
     pub fn add_ref_local(this: NonNull<Self>) {
         todo!()

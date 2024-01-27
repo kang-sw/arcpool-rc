@@ -66,6 +66,20 @@ where
     }
 }
 
+impl<T> WeakPool<T>
+where
+    T: 'static,
+{
+    pub fn upgrade(&self) -> Option<Pool<T>> {
+        self.inner.upgrade().map(|inner| Pool { inner })
+    }
+}
+
+// ========================================================== Local Pool API ===|
+
+// TODO: A totally unique reference to Pool<T> can be downgraded to LocalPool
+//   - Which disables any atomic variable checking
+
 // ========================================================== Pool Item ===|
 
 pub struct PoolItem<T> {
