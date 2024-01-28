@@ -454,18 +454,24 @@ where
 
         debug_assert!(unsafe { slot_ref.atomic_strong().load(Ordering::Relaxed) == 0 });
 
-        // Increment generation as early as possible. This expires every other weak references
-        // referring to this version of strong reference.
-        slot_ref.generation.fetch_add(1, Ordering::Release);
+        // Check if this is the sole reference remaining including entire weak references.
+        let last_weak_ref = unsafe { slot_ref.atomic_weak() }.fetch_sub(1, Ordering::Acquire) == 1;
+
+        if last_weak_ref {
+            // If this is last weak reference; reset generation value to 0. This will reduce
+            // possibility of generation overflow.
+            slot_ref.generation.store(0, Ordering::Release);
+        } else {
+            // If there's any alive weak reference, increment generation as early as possible. This
+            // expires every other weak references referring to this version of strong reference.
+            slot_ref.generation.fetch_add(1, Ordering::Release);
+        }
 
         // Will increment generation by 1 if it has any alive weak reference(except this).
         // Otherwise, generation is reset to 0 and pushed to total free list.
 
         // Cleanup inner data
         self.clean_func.call(&mut slot_ref.value);
-
-        // Check if this is the sole reference remaining including entire weak references.
-        let last_weak_ref = unsafe { slot_ref.atomic_weak() }.fetch_sub(1, Ordering::Acquire) == 1;
 
         if !last_weak_ref {
             // put it back to free_head_with_ref
@@ -935,6 +941,8 @@ impl<T: 'static> Slot<T> {
             return;
         }
 
+        debug_assert!(prev_strong != 0, "what?");
+
         // Since we're the last reference and observed that strong count is zero, it's guaranteed
         // that no other weak reference can upgrade this handle to valid strong reference.
 
@@ -1064,17 +1072,11 @@ impl<T: 'static> Slot<T> {
     pub fn downgrade(this_ptr: NonNull<Self>) -> u32 {
         let this = Self::access(&this_ptr);
 
-        // Increment weak refernce count preemptively. It's okay to be just release, as it never
-        // drops below 1 since this has strong reference.
+        // Add weak reference.
         unsafe { this.atomic_weak() }.fetch_add(1, Ordering::Relaxed);
 
         // Before releasing strong reference, retrive current generation value.
-        let gen = this.generation.load(Ordering::Relaxed);
-
-        // Now we can safely release the strong reference.
-        Self::release(this_ptr);
-
-        gen
+        this.generation.load(Ordering::Relaxed)
     }
 
     #[inline(always)]
