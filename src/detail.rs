@@ -11,6 +11,18 @@ use std::{
 use parking_lot::Mutex;
 
 pub(crate) mod pool {
+    use std::{
+        ptr::null_mut,
+        sync::{
+            atomic::{AtomicUsize, Ordering},
+            Arc,
+        },
+    };
+
+    use parking_lot::Mutex;
+
+    use super::{Counter, FnApply, FnCreate, PageLock, PoolInnerImpl, Slot};
+
     #[derive(Default)]
     pub struct Builder<T, CreateFn, PrepareFn, CleanFn> {
         _marker_ty: std::marker::PhantomData<T>,
@@ -19,12 +31,170 @@ pub(crate) mod pool {
         prepare_func: PrepareFn,
         clean_func: CleanFn,
         use_page_alloc_lock: bool,
+        use_item_counter: bool,
+    }
+
+    // ==== Builder implementation ====
+
+    impl<T> crate::Pool<T> {
+        pub fn builder() -> Builder<T, (), (), ()> {
+            Builder {
+                _marker_ty: Default::default(),
+                page_size: 32, // Default page size
+                init_func: (),
+                prepare_func: (),
+                clean_func: (),
+                use_page_alloc_lock: false,
+                use_item_counter: false,
+            }
+        }
+    }
+
+    impl<T, CreateFn, PrepareFn, CleanFn> Builder<T, CreateFn, PrepareFn, CleanFn>
+    where
+        T: 'static + Send,
+        CreateFn: FnCreate<T>,
+        PrepareFn: FnApply<T>,
+        CleanFn: FnApply<T>,
+    {
+        pub fn finish(self) -> crate::Pool<T> {
+            match (self.use_item_counter, self.use_page_alloc_lock) {
+                (true, true) => self.finish_with(AtomicCounter::default(), Mutex::new(())),
+                (true, false) => self.finish_with(AtomicCounter::default(), ()),
+                (false, true) => self.finish_with((), Mutex::new(())),
+                (false, false) => self.finish_with((), ()),
+            }
+        }
+
+        fn finish_with<C: Counter, L: PageLock>(self, counter: C, lock: L) -> crate::Pool<T> {
+            let inner = Arc::new(PoolInnerImpl {
+                free_head: Mutex::new(null_mut()),
+                free_head_may_weak: Mutex::new(null_mut()),
+                fallback_page_size: self.page_size.try_into().unwrap(),
+                init_func: self.init_func,
+                prepare_func: self.prepare_func,
+                clean_func: self.clean_func,
+                alloc_lock: lock,
+                item_counter: counter,
+            });
+
+            crate::Pool { inner }
+        }
+    }
+
+    impl<T, CreateFn, PrepareFn, CleanFn> Builder<T, CreateFn, PrepareFn, CleanFn> {
+        /// Specify default page allocation size when [`crate::Pool::checkout`] or
+        /// [`crate::Pool::checkout_local`] fails due to lack of available element.
+        pub fn with_default_page_size(mut self, page_size: usize) -> Self {
+            assert!(page_size > 0, "page size must be greater than zero");
+
+            self.page_size = page_size;
+            self
+        }
+
+        /// Specify if the page allocation lock is acquired before performing default page
+        /// allocation.
+        ///
+        /// Acquiring the lock isn't mandatory for page allocation, but it's recommended when
+        /// default page size is set as large value.
+        ///
+        /// The allocation process involves executing user-provided initialization logic, which can
+        /// have unpredictable execution time. Without the lock, multiple threads might concurrently
+        /// see empty free element stacks and allocate pages for each.
+        ///
+        /// Although this results in excessive memory allocation, all 'extra' allocations will be
+        /// added to the free list effectively. Moreover, the user-provided initialization logic
+        /// will run concurrently in this scenario. Thus, disabling the allocation lock can be a
+        /// valid policy if extensive capacity expansion is preferred.
+        pub fn with_page_allocation_lock(mut self, enabled: bool) -> Self {
+            self.use_page_alloc_lock = enabled;
+            self
+        }
+
+        /// Specify whether to use item counter internally. This exposes
+        pub fn with_item_counter(mut self, enabled: bool) -> Self {
+            self.use_item_counter = enabled;
+            self
+        }
+
+        /// Specify function which is used when creating new page element from base. It is called
+        /// only for once every element slot allocation.
+        pub fn with_initializer<F>(self, func: F) -> Builder<T, F, PrepareFn, CleanFn>
+        where
+            F: Fn() -> T + Send + Sync + 'static,
+        {
+            Builder {
+                _marker_ty: self._marker_ty,
+                page_size: self.page_size,
+                init_func: func,
+                prepare_func: self.prepare_func,
+                clean_func: self.clean_func,
+                use_page_alloc_lock: self.use_page_alloc_lock,
+                use_item_counter: self.use_item_counter,
+            }
+        }
+
+        /// Specify function which will be invoked every time that the reference is deallocated.
+        ///
+        /// e.g. cleaning vectors, etc ...
+        pub fn with_cleanup<F>(self, func: F) -> Builder<T, CreateFn, PrepareFn, F>
+        where
+            F: Fn(&mut T) + Send + Sync + 'static,
+        {
+            Builder {
+                _marker_ty: self._marker_ty,
+                page_size: self.page_size,
+                init_func: self.init_func,
+                prepare_func: self.prepare_func,
+                clean_func: func,
+                use_page_alloc_lock: self.use_page_alloc_lock,
+                use_item_counter: self.use_item_counter,
+            }
+        }
+
+        /// Specify function which is invoked every time you checkout any element from this pool.
+        ///
+        /// [`Builder::with_cleanup`] and [`Builder::with_prepare`] can be specified both, the
+        /// former is releasing resource, and the latter can be used kind of expensive resource
+        /// acquiring, etc ..
+        pub fn with_prepare<F>(self, func: F) -> Builder<T, CreateFn, F, CleanFn>
+        where
+            F: Fn(&mut T) + Send + Sync + 'static,
+        {
+            Builder {
+                _marker_ty: self._marker_ty,
+                page_size: self.page_size,
+                init_func: self.init_func,
+                prepare_func: func,
+                clean_func: self.clean_func,
+                use_page_alloc_lock: self.use_page_alloc_lock,
+                use_item_counter: self.use_item_counter,
+            }
+        }
     }
 
     // ==== Builder Component: Cleaner Function ====
 
-    impl<T> super::ApplyFunc<T> for () {
+    impl<T> FnApply<T> for () {
         fn call(&self, _: &mut T) {}
+    }
+
+    impl<T, F: Fn(&mut T) + Send + Sync + 'static> FnApply<T> for F {
+        fn call(&self, value: &mut T) {
+            self(value)
+        }
+    }
+
+    impl<T: Default> FnCreate<T> for () {
+        fn call(&self) -> T {
+            T::default()
+        }
+    }
+
+    impl<T, F: Fn() -> T + Send + Sync + 'static> FnCreate<T> for F {
+        fn call(&self) -> T {
+            self()
+        }
     }
 
     // ==== Builder Component: Page Lock ====
@@ -48,6 +218,47 @@ pub(crate) mod pool {
     }
 
     // ==== Builder Component: Value Counter ====
+    #[derive(Default)]
+    struct AtomicCounter {
+        total: AtomicUsize,
+        free: AtomicUsize,
+    }
+
+    impl Counter for AtomicCounter {
+        fn inc_total_by(&self, total: usize) {
+            self.total.fetch_add(total, Ordering::Relaxed);
+        }
+
+        fn inc_free_item_by(&self, free: usize) {
+            self.free.fetch_add(free, Ordering::Relaxed);
+        }
+
+        fn dec_free_item(&self) {
+            self.free.fetch_sub(1, Ordering::Relaxed);
+        }
+
+        fn total_item(&self) -> Option<usize> {
+            Some(self.total.load(Ordering::Relaxed))
+        }
+
+        fn free_item(&self) -> Option<usize> {
+            Some(self.free.load(Ordering::Relaxed))
+        }
+    }
+
+    impl Counter for () {
+        fn inc_total_by(&self, _: usize) {}
+        fn inc_free_item_by(&self, _: usize) {}
+        fn dec_free_item(&self) {}
+
+        fn total_item(&self) -> Option<usize> {
+            None
+        }
+
+        fn free_item(&self) -> Option<usize> {
+            None
+        }
+    }
 }
 
 pub(crate) trait PoolInner<T>: Send + Sync + 'static {
@@ -112,8 +323,13 @@ struct PoolInnerImpl<T, CreateFn, PrepareFn, CleanFn, Counter, AllocLock> {
 unsafe impl<T1, T2, T3, T4, T5, T6> Send for PoolInnerImpl<T1, T2, T3, T4, T5, T6> {}
 unsafe impl<T1, T2, T3, T4, T5, T6> Sync for PoolInnerImpl<T1, T2, T3, T4, T5, T6> {}
 
-trait ApplyFunc<T>: 'static + Send + Sync {
+#[doc(hidden)]
+pub trait FnApply<T>: 'static + Send + Sync {
     fn call(&self, _: &mut T);
+}
+
+pub trait FnCreate<T>: 'static + Send + Sync {
+    fn call(&self) -> T;
 }
 
 trait PageLock: 'static + Send + Sync {
@@ -159,9 +375,9 @@ impl<T, CreateFn, PrepareFn, CleanFn, Cnt, AllocLock> PoolInner<T>
     for PoolInnerImpl<T, CreateFn, PrepareFn, CleanFn, Cnt, AllocLock>
 where
     T: 'static,
-    CreateFn: Fn() -> T + Send + Sync + 'static,
-    PrepareFn: ApplyFunc<T>,
-    CleanFn: ApplyFunc<T>,
+    CreateFn: FnCreate<T>,
+    PrepareFn: FnApply<T>,
+    CleanFn: FnApply<T>,
     Cnt: Counter,
     AllocLock: PageLock,
 {
@@ -326,9 +542,9 @@ impl<T, CreateFn, PrepareFn, CleanFn, Cnt, AllocLock>
     PoolInnerImpl<T, CreateFn, PrepareFn, CleanFn, Cnt, AllocLock>
 where
     T: 'static,
-    CreateFn: Fn() -> T + Send + Sync + 'static,
-    PrepareFn: ApplyFunc<T>,
-    CleanFn: ApplyFunc<T>,
+    CreateFn: FnCreate<T>,
+    PrepareFn: FnApply<T>,
+    CleanFn: FnApply<T>,
     Cnt: Counter,
     AllocLock: PageLock,
 {
@@ -408,18 +624,6 @@ where
 
     fn expand_by_default(&self) {
         if let Some(_job) = self.alloc_lock.try_acquire_job() {
-            // TODO: Move this to the doc comment of builder.
-
-            // Acquiring this lock isn't mandatory for page allocation, but it's
-            // recommended. The allocation process involves executing user-provided
-            // initialization logic, which can have unpredictable execution time.
-            //
-            // Without the lock, multiple threads might concurrently see empty free element
-            // stacks and overallocate pages. Although this results in excessive memory
-            // allocation, all 'extra' allocations will be added to the free list
-            // effectively. Moreover, the user-provided initialization logic will run
-            // concurrently in this scenario. Thus, disabling the allocation lock can be a
-            // valid policy if extensive capacity expansion is preferred.
             self.allocate_page_impl(None);
         } else {
             // Wait for another thread that has acquired the job handle to complete its
@@ -488,7 +692,7 @@ where
         for (index, slot_ref) in payload_slice.iter_mut().enumerate() {
             let slot_ptr = slot_ref as *mut MaybeUninit<Slot<T>>;
             let slot_value = Slot::<T> {
-                value: (self.init_func)(), // TODO: Check panic behavior
+                value: self.init_func.call(), // TODO: Check panic behavior
 
                 // SAFETY:
                 // - For 0..end-1 elems, its not yet initialized, but we'll.

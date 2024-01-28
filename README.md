@@ -12,6 +12,7 @@ frequent and performance is critical.
 - **Concurrency-Friendly:** Designed to operate safely and efficiently in multithreaded contexts.
 - **Optimized for Reuse:** Encourages reuse of memory blocks, reducing the cost of memory
   operations.
+- **Full of unverified Unsafe code** Use this at your own risk ... I will. 🤣
 
 ## Usage
 
@@ -29,9 +30,9 @@ use arcpool::Pool;
 
 fn main() {
 	let pool = Pool::<Vec<u8>>::builder()
-		.with_page_size(128)
-		.with_init_fn(|| Vec::with_capacity(1024))
-		.with_prepare_fn(Vec::clear)
+		.with_default_page_size(128)
+		.with_initializer(|| Vec::with_capacity(1024))
+		.with_cleanup(Vec::clear)
 		.build();
 	
 	let ptr = pool.checkout();

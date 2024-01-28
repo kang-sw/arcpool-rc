@@ -4,11 +4,11 @@ use std::{
     sync::{Arc, Weak},
 };
 
-use crate::detail::{pool::Builder, PoolInner, Slot};
+use crate::detail::{PoolInner, Slot};
 
 #[derive(Clone)]
 pub struct Pool<T> {
-    inner: Arc<dyn PoolInner<T>>,
+    pub(super) inner: Arc<dyn PoolInner<T>>,
 }
 
 #[derive(Clone)]
@@ -20,10 +20,6 @@ impl<T> Pool<T>
 where
     T: 'static,
 {
-    pub fn builder() -> Builder<T, (), (), ()> {
-        todo!()
-    }
-
     /// Allocate new item from pool. If no free slot presents, new page will be allocated.
     ///
     /// The returned item will automatically be checked in when dropped. The returned item is not
@@ -75,6 +71,17 @@ where
         WeakPool {
             inner: Arc::downgrade(&self.inner),
         }
+    }
+
+    /// Get number of totally created elements. Returns `None` if the counter feature wasn't
+    /// enabled for this pool.
+    pub fn total_item_len(&self) -> Option<usize> {
+        self.inner.num_total_items()
+    }
+
+    /// Get number of unused items inside the pool.
+    pub fn free_item_len(&self) -> Option<usize> {
+        self.inner.num_free_items()
     }
 }
 
