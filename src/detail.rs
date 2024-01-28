@@ -69,8 +69,8 @@ pub(crate) mod pool {
 
         fn finish_with<C: Counter, L: PageLock>(self, counter: C, lock: L) -> crate::Pool<T> {
             let inner = Arc::new(PoolInnerImpl {
-                free_head: Mutex::new(null_mut()).into(),
-                free_head_may_weak: Mutex::new(null_mut()).into(),
+                free_head: Default::default(),
+                free_head_may_weak: Default::default(),
                 fallback_page_size: self.page_size.try_into().unwrap(),
                 init_func: self.init_func,
                 prepare_func: self.prepare_func,
@@ -303,12 +303,12 @@ struct PoolInnerImpl<T, CreateFn, PrepareFn, CleanFn, Counter, AllocLock> {
     //   - A can detect this; (cache invalidated!)
     //   - But, other thread still tries to access already allocated node 2.
     //   - Need to avoid this situation ... but, how?
-    free_head: CachePadded<Mutex<*mut Slot<T>>>,
+    free_head: slot::Table<T>,
 
     /// If only the strong reference was released (in sync) (i.e. any weak reference presents),
     /// the node will be stored here. Only `sync` checkouts are allowed to access this storage,
     /// as the generation based hot reuse is exclusively permitted for atomic versions.
-    free_head_may_weak: CachePadded<Mutex<*mut Slot<T>>>,
+    free_head_may_weak: slot::Table<T>,
 
     fallback_page_size: NonZeroUsize,
 
@@ -362,9 +362,6 @@ struct PageHeader<T> {
     /// Original buffer, **_contains_** `self` at start.
     raw_buffer: NonNull<[MaybeUninit<Slot<T>>]>,
 
-    /// `raw_buffer[payload_start_index..]` is content.
-    payload_start_index: u32,
-
     /// Only referred during entire pool destruction. When it reaches == `page_length`, the
     /// entire page will be deallocated.
     dealloc_counter: u32,
@@ -401,14 +398,14 @@ where
             //   * Access to `free_head_may_weak` is possibly shared between "already expired" weak
             //     references, however, they are guaranteed to not elevate/interfere slot jobs
             unsafe {
-                if let Some(slot) = try_pop_slot(&self.free_head_may_weak) {
+                if let Some(slot) = self.free_head_may_weak.pop() {
                     self.mark_slot_checkout(slot, true);
                     break slot;
                 }
 
                 // If there are no available references in the weak stack, we then check all the
                 // stacks.
-                if let Some(slot) = try_pop_slot(&self.free_head) {
+                if let Some(slot) = self.free_head.pop() {
                     self.mark_slot_checkout(slot, false);
                     break slot;
                 }
@@ -426,7 +423,7 @@ where
             // are released.
             //
             // SAFETY: Same as above.
-            if let Some(slot) = unsafe { try_pop_slot(&self.free_head) } {
+            if let Some(slot) = unsafe { self.free_head.pop() } {
                 self.mark_slot_checkout_local(slot);
                 break slot;
             }
@@ -474,14 +471,16 @@ where
         // Cleanup inner data
         self.clean_func.call(&mut slot_ref.value);
 
-        if !last_weak_ref {
-            // put it back to free_head_with_ref
-            push_slot(&self.free_head_may_weak, slot_ref.into());
-        } else {
-            // put it back to free_head
-            push_slot(&self.free_head, slot_ref.into());
+        unsafe {
+            if !last_weak_ref {
+                // put it back to free_head_with_ref
+                self.free_head_may_weak.push(slot_ref, None);
+            } else {
+                // put it back to free_head
+                self.free_head.push(slot_ref, None);
 
-            self.sync_slot_dispose(slot_ref);
+                self.sync_slot_dispose(slot_ref);
+            }
         }
 
         // NOTE: EXTRA CAUTION HERE; since THIS line, any interaction with `self` or `slot_ref` must
@@ -518,20 +517,6 @@ where
 
         todo!()
     }
-}
-
-/// Tries to pop the foremost slot from the given head socket. it'll return [`None`] when it
-/// eventually fails since there's no more elements to pop.
-unsafe fn try_pop_slot<T>(head: &Mutex<*mut Slot<T>>) -> Option<NonNull<Slot<T>>> {
-    let mut head = head.lock();
-
-    let new_head = head.as_mut()?.next_free;
-    let popped = replace(&mut *head, new_head);
-
-    drop(head); // Drops lock early as possible.
-    (*popped).next_free = null_mut();
-
-    Some(NonNull::new_unchecked(popped))
 }
 
 fn push_slot<T>(head: &Mutex<*mut Slot<T>>, mut slot: NonNull<Slot<T>>) {
@@ -695,7 +680,6 @@ where
             // SAFETY: We'll never mutably access owner.
             owner: unsafe { NonNull::new_unchecked(transmute(self_dyn)) },
             raw_buffer,
-            payload_start_index: payload_offset as _,
             dealloc_counter: elem_count as _,
         };
 
@@ -746,6 +730,9 @@ where
             )
         };
 
+        // The last element currently pointing invalid pointer address ... Clear it.
+        last_elem.next_free = null_mut();
+
         // Preemptively increment both the total and free counts here. It's particularly
         // important to increment the free count before inserting a new page into the stack, as
         // failing to do so could reduce the free count below zero, potentially causing a panic
@@ -757,9 +744,7 @@ where
         self.item_counter.inc_free_item_by(elem_count);
 
         // Prepend the whole page allocation to existing free head stack.
-        let mut free_head = self.free_head.lock();
-        last_elem.next_free = *free_head;
-        *free_head = first_ptr;
+        unsafe { self.free_head.push(first_ptr, Some(last_elem)) };
     }
 }
 
@@ -812,8 +797,10 @@ impl<T, CreateFn, PrepareFn, CleanFn, Counter, AllocLock> Drop
             }
         };
 
-        track_release_fn(*self.free_head.lock());
-        track_release_fn(*self.free_head_may_weak.lock());
+        self.free_head
+            .for_each_head(|slot| track_release_fn(slot.as_ptr()));
+        self.free_head_may_weak
+            .for_each_head(|slot| track_release_fn(slot.as_ptr()));
     }
 }
 

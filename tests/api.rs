@@ -26,8 +26,17 @@ fn test_pool_api(pool: arcpool::Pool<String>) {
     drop(arg);
 
     // Check internal logic: Reuse recent first
-    let arg = pool.checkout();
-    assert_eq!(*arg, "hello, world!");
+    let mut retries = 32;
+
+    while retries > 0 {
+        let arg = pool.checkout();
+        if *arg == "hello, world!" {
+            break;
+        }
+        retries -= 1;
+    }
+
+    assert_ne!(retries, 0);
 
     let _back = pool.checkout();
     let arg = pool.checkout();

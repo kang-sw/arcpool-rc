@@ -15,12 +15,22 @@ pub(super) struct Table<T> {
     elems: [AtomicPtr<Slot<T>>; 14],
 }
 
-impl<T> Table<T> {
-    pub fn new() -> Self {
+impl<T> Default for Table<T> {
+    fn default() -> Self {
         Self {
-            pop_index: AtomicUsize::new(0),
-            push_index: AtomicUsize::new(0),
+            pop_index: Default::default(),
+            push_index: Default::default(),
             elems: Default::default(),
+        }
+    }
+}
+
+impl<T> Table<T> {
+    pub fn for_each_head(&mut self, mut f: impl FnMut(NonNull<Slot<T>>)) {
+        for socket in &self.elems {
+            if let Some(ptr) = NonNull::new(socket.load(Relaxed)) {
+                f(ptr);
+            }
         }
     }
 
@@ -29,9 +39,10 @@ impl<T> Table<T> {
     /// Given element must be exclusively accessible,
     pub unsafe fn push(&self, elem: *mut Slot<T>, tail: Option<&mut Slot<T>>) {
         debug_assert!(!elem.is_null());
-        debug_assert!((*elem).next_free.is_null());
 
         let tail = tail.unwrap_or(&mut *elem) as *mut Slot<T>;
+        debug_assert!((*tail).next_free.is_null());
+
         let push_index = self.push_index.fetch_add(1, Relaxed);
 
         let index = push_index % self.elems.len();
@@ -74,9 +85,10 @@ impl<T> Table<T> {
 
         while tried_bits != 0 {
             let index = pop_index % self.elems.len();
-            pop_index += 5; // Adding 3 is same as above context, to prevent contension between
-                            // threads as much as possible; This allows 5 concurrent tasks
-                            // rotate without contension at least 3 tries.
+            pop_index = pop_index.wrapping_add(5);
+            // ^^^^^^ Adding 5 is same as above context, to prevent contension between threads as
+            // much as possible; This allows 5 concurrent tasks rotate without contension at least
+            // for 3 tries.
 
             let socket = &self.elems[index];
 
@@ -111,7 +123,7 @@ impl<T> Table<T> {
 
             if slot.is_null() {
                 // It's empty slot. Consume one retry and jump to next.
-                socket.swap(null_mut(), Relaxed);
+                socket.swap(null_mut(), Release);
 
                 tried_bits &= !(1 << index);
                 continue;
@@ -127,6 +139,9 @@ impl<T> Table<T> {
             // Roll back the socket state as soon as possible, and now we can safely deal with
             // popped slot now.
             socket.swap((*slot).next_free, Release);
+
+            // Clear next node.
+            (*slot).next_free = null_mut();
 
             return Some(NonNull::new_unchecked(slot));
         }
