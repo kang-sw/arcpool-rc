@@ -13,16 +13,14 @@ const ROTATE_AMOUNT: usize = 5;
 
 #[repr(C)]
 pub(super) struct Table<T> {
-    pop_index: AtomicUsize,
-    push_index: AtomicUsize,
+    access_index: AtomicUsize,
     elems: [AtomicPtr<Slot<T>>; HEAD_SOCKET_COUNT],
 }
 
 impl<T> Default for Table<T> {
     fn default() -> Self {
         Self {
-            pop_index: Default::default(),
-            push_index: Default::default(),
+            access_index: Default::default(),
             elems: Default::default(),
         }
     }
@@ -46,8 +44,6 @@ impl<T> Table<T> {
         let tail = tail.unwrap_or(&mut *elem) as *mut Slot<T>;
         debug_assert!((*tail).next_free.is_null());
 
-        let mut push_index = self.push_index.fetch_sub(1, Relaxed);
-
         // - Set order should be Release, to make `next_free` visible to other thread.
         // - We won't care the fetch order
 
@@ -62,15 +58,12 @@ impl<T> Table<T> {
         };
 
         loop {
-            let index = push_index % self.elems.len();
+            let index = self.access_index.fetch_add(1, Relaxed) % self.elems.len();
             let socket = &self.elems[index];
 
             if socket.fetch_update(Release, Relaxed, update_func).is_ok() {
                 return;
             }
-
-            // If we fail to push element, rotate slot to push by 1.
-            push_index = push_index.wrapping_add(1);
 
             // We're spinning now!
             std::hint::spin_loop();
@@ -78,17 +71,15 @@ impl<T> Table<T> {
     }
 
     pub unsafe fn pop(&self) -> Option<NonNull<Slot<T>>> {
-        let mut pop_index = self.pop_index.fetch_sub(1, Relaxed);
-        // ^^^ We're using `fetch_sub` to calculating rotate start index. Since every task
-        // rotates forward to find available elements, if we increment `self.pop_index` then
-        // it'll more likely collide with other thread's ongoing fetch request.
+        let mut chance_bits = (1 << self.elems.len()) - 1;
 
-        let mut tried_bits = (1 << self.elems.len()) - 1;
+        while chance_bits != 0 {
+            let index = self.access_index.fetch_add(1, Relaxed) % self.elems.len();
 
-        while tried_bits != 0 {
-            let index = pop_index % self.elems.len();
-            pop_index = pop_index.wrapping_add(ROTATE_AMOUNT);
-            //                                ^^^ This will reduce consumer collision.
+            if chance_bits & (1 << index) == 0 {
+                // Already tried this slot.
+                continue;
+            }
 
             let socket = &self.elems[index];
 
@@ -125,7 +116,7 @@ impl<T> Table<T> {
                 // It's empty slot. Consume one retry and jump to next.
                 socket.swap(null_mut(), Release);
 
-                tried_bits &= !(1 << index);
+                chance_bits &= !(1 << index);
                 continue;
             }
 
