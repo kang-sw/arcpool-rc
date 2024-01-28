@@ -7,7 +7,7 @@ macro_rules! pull_ {
         $pool.pull()
     };
     ($pool:ident, 2) => {
-        $pool.pull(|| Vec::with_capacity(4096))
+        $pool.pull(Default::default)
     };
     ($pool:ident, 3) => {
         $pool.create().unwrap()
@@ -43,6 +43,52 @@ macro_rules! bench_alloc_impl_ {
             let mut items = Vec::new();
             b.iter(|| {
                 items.push(pull_!(pool, $pull_impl));
+            });
+        });
+    };
+}
+
+#[macro_export]
+macro_rules! bench_recycle_alloc_impl_ {
+    ($group:expr, $name:literal, $expression:expr, $pull_impl:tt) => {
+        $group.bench_function($name, |b| {
+            let pool = $expression;
+            let mut items = Vec::new();
+            b.iter_custom(|iter| {
+                let start_at = std::time::Instant::now();
+
+                for n in 0..iter {
+                    match n % 1000 {
+                        0..=149 => {
+                            items.push(pull_!(pool, $pull_impl));
+                        }
+
+                        150..=199 => {
+                            items.swap_remove(9989 % items.len());
+                        }
+
+                        200..=399 => {
+                            items.push(pull_!(pool, $pull_impl));
+                        }
+
+                        400..=649 => {
+                            items.swap_remove(9989 % items.len());
+                        }
+
+                        650..=799 => {
+                            items.push(pull_!(pool, $pull_impl));
+                        }
+
+                        800..=999 => {
+                            items.swap_remove(9989 % items.len());
+                        }
+
+                        _ => unreachable!(),
+                    }
+                    items.push(pull_!(pool, $pull_impl));
+                }
+
+                start_at.elapsed()
             });
         });
     };

@@ -11,31 +11,20 @@ mod bench_tools;
 #[macro_use]
 mod bench_generic;
 
-struct Vec4096 {
+struct AllocBenchElem {
     _data: Vec<u8>,
 }
 
-impl Default for Vec4096 {
+impl Default for AllocBenchElem {
     fn default() -> Self {
         Self {
-            _data: Vec::with_capacity(16 * 1024),
+            _data: Vec::with_capacity(4096),
         }
     }
 }
 
-impl sharded_slab::Clear for Vec4096 {
+impl sharded_slab::Clear for AllocBenchElem {
     fn clear(&mut self) {}
-}
-
-#[derive(Clone)]
-struct BigElem {
-    _inner: [u8; 128],
-}
-
-impl Default for BigElem {
-    fn default() -> Self {
-        Self { _inner: [0; 128] }
-    }
 }
 
 fn bench_alloc(c: &mut Criterion) {
@@ -43,54 +32,95 @@ fn bench_alloc(c: &mut Criterion) {
     bench_alloc_impl_!(
         group,
         "arcpool sync mode",
-        arcpool::Pool::<Vec<u8>>::builder()
-            .with_initializer(|| Vec::<u8>::with_capacity(16 * 1024))
+        arcpool::Pool::<AllocBenchElem>::builder()
+            .with_initializer(Default::default)
             .finish(),
         4_sync
     );
     bench_alloc_impl_!(
         group,
-        "none object poll",
-        lockfree_object_pool::NoneObjectPool::new(|| Vec::<u8>::with_capacity(16 * 1024)),
+        "crate 'lockfree-object-pool' / none",
+        lockfree_object_pool::NoneObjectPool::<AllocBenchElem>::new(Default::default),
         1
     );
     bench_alloc_impl_!(
         group,
-        "mutex object poll",
-        lockfree_object_pool::MutexObjectPool::<Vec<u8>>::new(
-            || Vec::with_capacity(16 * 1024),
-            |_v| {}
-        ),
+        "crate 'lockfree-object-pool' / mutex",
+        lockfree_object_pool::MutexObjectPool::<AllocBenchElem>::new(Default::default, |_v| {}),
         1
     );
     bench_alloc_impl_!(
         group,
-        "spin_lock object poll",
-        lockfree_object_pool::SpinLockObjectPool::<Vec<u8>>::new(
-            || Vec::with_capacity(16 * 1024),
-            |_v| {}
-        ),
+        "crate 'lockfree-object-pool' / spin_lock",
+        lockfree_object_pool::SpinLockObjectPool::<AllocBenchElem>::new(Default::default, |_v| {}),
         1
     );
     bench_alloc_impl_!(
         group,
-        "linear object poll",
-        lockfree_object_pool::LinearObjectPool::<Vec<u8>>::new(
-            || Vec::with_capacity(16 * 1024),
-            |_v| {}
-        ),
+        "crate 'lockfree-object-pool' / linear",
+        lockfree_object_pool::LinearObjectPool::<AllocBenchElem>::new(Default::default, |_v| {}),
         1
     );
     bench_alloc_impl_!(
         group,
         "crate 'object-pool'",
-        object_pool::Pool::<Vec<u8>>::new(32, || Vec::with_capacity(4096)),
+        object_pool::Pool::<AllocBenchElem>::new(32, Default::default),
         2
     );
     bench_alloc_impl_!(
         group,
         "crate 'sharded-slab'",
-        sharded_slab::Pool::<Vec4096>::new(),
+        sharded_slab::Pool::<AllocBenchElem>::new(),
+        3
+    );
+    group.finish();
+}
+
+fn bench_alloc_recycle(c: &mut Criterion) {
+    let mut group = c.benchmark_group("recycling allocation");
+
+    bench_recycle_alloc_impl_!(
+        group,
+        "arcpool sync mode",
+        arcpool::Pool::<AllocBenchElem>::builder()
+            .with_initializer(Default::default)
+            .finish(),
+        4_sync
+    );
+    bench_recycle_alloc_impl_!(
+        group,
+        "crate 'lockfree-object-pool' / none",
+        lockfree_object_pool::NoneObjectPool::<AllocBenchElem>::new(Default::default),
+        1
+    );
+    bench_recycle_alloc_impl_!(
+        group,
+        "crate 'lockfree-object-pool' / mutex",
+        lockfree_object_pool::MutexObjectPool::<AllocBenchElem>::new(Default::default, |_v| {}),
+        1
+    );
+    bench_recycle_alloc_impl_!(
+        group,
+        "crate 'lockfree-object-pool' / spin_lock",
+        lockfree_object_pool::SpinLockObjectPool::<AllocBenchElem>::new(Default::default, |_v| {}),
+        1
+    );
+    bench_recycle_alloc_impl_!(
+        group,
+        "crate 'lockfree-object-pool' / linear",
+        lockfree_object_pool::LinearObjectPool::<AllocBenchElem>::new(Default::default, |_v| {}),
+        1
+    );
+    bench_recycle_alloc_impl_!(
+        group,
+        "crate 'object-pool'",
+        object_pool::Pool::<AllocBenchElem>::new(32, Default::default),
+        2
+    );
+    bench_recycle_alloc_impl_!(
+        group,
+        "crate 'sharded-slab'",
+        sharded_slab::Pool::<AllocBenchElem>::new(),
         3
     );
     group.finish();
@@ -101,54 +131,45 @@ fn bench_free(c: &mut Criterion) {
     bench_free_impl_!(
         group,
         "arcpool sync mode",
-        arcpool::Pool::<Vec<u8>>::builder()
-            .with_initializer(|| Vec::<u8>::with_capacity(16 * 1024))
+        arcpool::Pool::<AllocBenchElem>::builder()
+            .with_initializer(Default::default)
             .finish(),
         4_sync
     );
     bench_free_impl_!(
         group,
-        "none object poll",
-        lockfree_object_pool::NoneObjectPool::new(|| Vec::<u8>::with_capacity(16 * 1024)),
+        "crate 'lockfree-object-pool' / none",
+        lockfree_object_pool::NoneObjectPool::<AllocBenchElem>::new(Default::default),
         1
     );
     bench_free_impl_!(
         group,
-        "mutex object poll",
-        lockfree_object_pool::MutexObjectPool::<Vec<u8>>::new(
-            || Vec::with_capacity(16 * 1024),
-            |_v| {}
-        ),
+        "crate 'lockfree-object-pool' / mutex",
+        lockfree_object_pool::MutexObjectPool::<AllocBenchElem>::new(Default::default, |_v| {}),
         1
     );
     bench_free_impl_!(
         group,
-        "spin_lock object poll",
-        lockfree_object_pool::SpinLockObjectPool::<Vec<u8>>::new(
-            || Vec::with_capacity(16 * 1024),
-            |_v| {}
-        ),
+        "crate 'lockfree-object-pool' / spin_lock",
+        lockfree_object_pool::SpinLockObjectPool::<AllocBenchElem>::new(Default::default, |_v| {}),
         1
     );
     bench_free_impl_!(
         group,
-        "linear object poll",
-        lockfree_object_pool::LinearObjectPool::<Vec<u8>>::new(
-            || Vec::with_capacity(16 * 1024),
-            |_v| {}
-        ),
+        "crate 'lockfree-object-pool' / linear",
+        lockfree_object_pool::LinearObjectPool::<AllocBenchElem>::new(Default::default, |_v| {}),
         1
     );
     bench_free_impl_!(
         group,
         "crate 'object-pool'",
-        object_pool::Pool::<Vec<u8>>::new(32, || Vec::with_capacity(4096)),
+        object_pool::Pool::<AllocBenchElem>::new(32, Default::default),
         2
     );
     bench_free_impl_!(
         group,
         "crate 'sharded-slab'",
-        sharded_slab::Pool::<Vec4096>::new(),
+        sharded_slab::Pool::<AllocBenchElem>::new(),
         3
     );
     group.finish();
@@ -159,63 +180,54 @@ fn bench_alloc_mt(c: &mut Criterion) {
     bench_alloc_mt_impl_!(
         group,
         "arcpool sync mode",
-        arcpool::Pool::<Vec<u8>>::builder()
-            .with_initializer(|| Vec::<u8>::with_capacity(16 * 1024))
+        arcpool::Pool::<AllocBenchElem>::builder()
+            .with_initializer(Default::default)
             .finish(),
         4_sync
     );
     bench_alloc_mt_impl_!(
         group,
         "arcpool sync mode with lock config",
-        arcpool::Pool::<Vec<u8>>::builder()
-            .with_initializer(|| Vec::<u8>::with_capacity(16 * 1024))
+        arcpool::Pool::<AllocBenchElem>::builder()
+            .with_initializer(Default::default)
             .with_page_allocation_lock(true)
             .finish(),
         4_sync
     );
     bench_alloc_mt_impl_!(
         group,
-        "none object poll",
-        lockfree_object_pool::NoneObjectPool::new(|| Vec::<u8>::with_capacity(16 * 1024)),
+        "crate 'lockfree-object-pool' / none",
+        lockfree_object_pool::NoneObjectPool::<AllocBenchElem>::new(Default::default),
         1
     );
     bench_alloc_mt_impl_!(
         group,
-        "mutex object poll",
-        lockfree_object_pool::MutexObjectPool::<Vec<u8>>::new(
-            || Vec::with_capacity(16 * 1024),
-            |_v| {}
-        ),
+        "crate 'lockfree-object-pool' / mutex",
+        lockfree_object_pool::MutexObjectPool::<AllocBenchElem>::new(Default::default, |_v| {}),
         1
     );
     bench_alloc_mt_impl_!(
         group,
-        "spin_lock object poll",
-        lockfree_object_pool::SpinLockObjectPool::<Vec<u8>>::new(
-            || Vec::with_capacity(16 * 1024),
-            |_v| {}
-        ),
+        "crate 'lockfree-object-pool' / spin_lock",
+        lockfree_object_pool::SpinLockObjectPool::<AllocBenchElem>::new(Default::default, |_v| {}),
         1
     );
     bench_alloc_mt_impl_!(
         group,
-        "linear object poll",
-        lockfree_object_pool::LinearObjectPool::<Vec<u8>>::new(
-            || Vec::with_capacity(16 * 1024),
-            |_v| {}
-        ),
+        "crate 'lockfree-object-pool' / linear",
+        lockfree_object_pool::LinearObjectPool::<AllocBenchElem>::new(Default::default, |_v| {}),
         1
     );
     bench_alloc_mt_impl_!(
         group,
         "crate 'object-pool'",
-        object_pool::Pool::<Vec<u8>>::new(32, || Vec::with_capacity(4096)),
+        object_pool::Pool::<AllocBenchElem>::new(32, Default::default),
         2
     );
     bench_alloc_mt_impl_!(
         group,
         "crate 'sharded-slab'",
-        sharded_slab::Pool::<Vec4096>::new(),
+        sharded_slab::Pool::<AllocBenchElem>::new(),
         3
     );
     group.finish();
@@ -226,54 +238,45 @@ fn bench_free_mt(c: &mut Criterion) {
     bench_free_mt_impl_!(
         group,
         "arcpool sync mode",
-        arcpool::Pool::<Vec<u8>>::builder()
-            .with_initializer(|| Vec::<u8>::with_capacity(16 * 1024))
+        arcpool::Pool::<AllocBenchElem>::builder()
+            .with_initializer(Default::default)
             .finish(),
         4_sync
     );
     bench_free_mt_impl_!(
         group,
-        "none object poll",
-        lockfree_object_pool::NoneObjectPool::new(|| Vec::<u8>::with_capacity(16 * 1024)),
+        "crate 'lockfree-object-pool' / none",
+        lockfree_object_pool::NoneObjectPool::<AllocBenchElem>::new(Default::default),
         1
     );
     bench_free_mt_impl_!(
         group,
-        "mutex object poll",
-        lockfree_object_pool::MutexObjectPool::<Vec<u8>>::new(
-            || Vec::with_capacity(16 * 1024),
-            |_v| {}
-        ),
+        "crate 'lockfree-object-pool' / mutex",
+        lockfree_object_pool::MutexObjectPool::<AllocBenchElem>::new(Default::default, |_v| {}),
         1
     );
     bench_free_mt_impl_!(
         group,
-        "spin_lock object poll",
-        lockfree_object_pool::SpinLockObjectPool::<Vec<u8>>::new(
-            || Vec::with_capacity(16 * 1024),
-            |_v| {}
-        ),
+        "crate 'lockfree-object-pool' / spin_lock",
+        lockfree_object_pool::SpinLockObjectPool::<AllocBenchElem>::new(Default::default, |_v| {}),
         1
     );
     bench_free_mt_impl_!(
         group,
-        "linear object poll",
-        lockfree_object_pool::LinearObjectPool::<Vec<u8>>::new(
-            || Vec::with_capacity(16 * 1024),
-            |_v| {}
-        ),
+        "crate 'lockfree-object-pool' / linear",
+        lockfree_object_pool::LinearObjectPool::<AllocBenchElem>::new(Default::default, |_v| {}),
         1
     );
     bench_free_mt_impl_!(
         group,
         "crate 'object-pool'",
-        object_pool::Pool::<Vec<u8>>::new(32, || Vec::with_capacity(4096)),
+        object_pool::Pool::<AllocBenchElem>::new(32, Default::default),
         2
     );
     bench_free_mt_impl_!(
         group,
         "crate 'sharded-slab'",
-        sharded_slab::Pool::<Vec4096>::new(),
+        sharded_slab::Pool::<AllocBenchElem>::new(),
         3
     );
     group.finish();
@@ -287,8 +290,8 @@ fn bench_forward_multi_thread(c: &mut Criterion, nb_writter: usize, nb_readder: 
     bench_forward_impl_!(
         group,
         "arcpool sync mode",
-        arcpool::Pool::<Vec<u8>>::builder()
-            .with_initializer(|| Vec::<u8>::with_capacity(16 * 1024))
+        arcpool::Pool::<AllocBenchElem>::builder()
+            .with_initializer(Default::default)
             .finish(),
         nb_readder,
         nb_writter,
@@ -296,41 +299,32 @@ fn bench_forward_multi_thread(c: &mut Criterion, nb_writter: usize, nb_readder: 
     );
     bench_forward_impl_!(
         group,
-        "none object poll",
-        lockfree_object_pool::NoneObjectPool::new(|| Vec::<u8>::with_capacity(16 * 1024)),
+        "crate 'lockfree-object-pool' / none",
+        lockfree_object_pool::NoneObjectPool::<AllocBenchElem>::new(Default::default),
         nb_readder,
         nb_writter,
         1
     );
     bench_forward_impl_!(
         group,
-        "mutex object poll",
-        lockfree_object_pool::MutexObjectPool::<Vec<u8>>::new(
-            || Vec::with_capacity(16 * 1024),
-            |_v| {}
-        ),
+        "crate 'lockfree-object-pool' / mutex",
+        lockfree_object_pool::MutexObjectPool::<AllocBenchElem>::new(Default::default, |_v| {}),
         nb_readder,
         nb_writter,
         1
     );
     bench_forward_impl_!(
         group,
-        "spin_lock object poll",
-        lockfree_object_pool::SpinLockObjectPool::<Vec<u8>>::new(
-            || Vec::with_capacity(16 * 1024),
-            |_v| {}
-        ),
+        "crate 'lockfree-object-pool' / spin_lock",
+        lockfree_object_pool::SpinLockObjectPool::<AllocBenchElem>::new(Default::default, |_v| {}),
         nb_readder,
         nb_writter,
         1
     );
     bench_forward_impl_!(
         group,
-        "linear object poll",
-        lockfree_object_pool::LinearObjectPool::<Vec<u8>>::new(
-            || Vec::with_capacity(16 * 1024),
-            |_v| {}
-        ),
+        "crate 'lockfree-object-pool' / linear",
+        lockfree_object_pool::LinearObjectPool::<AllocBenchElem>::new(Default::default, |_v| {}),
         nb_readder,
         nb_writter,
         1
@@ -338,7 +332,7 @@ fn bench_forward_multi_thread(c: &mut Criterion, nb_writter: usize, nb_readder: 
     bench_forward_impl_!(
         group,
         "crate 'sharded-slab'",
-        sharded_slab::Pool::<Vec4096>::new(),
+        sharded_slab::Pool::<AllocBenchElem>::new(),
         nb_readder,
         nb_writter,
         3
@@ -362,6 +356,10 @@ fn bench_forward_multi_thread11(c: &mut Criterion) {
     bench_forward_multi_thread(c, 1, 1);
 }
 
+// ========================================================== Dereference Benchmark ===|
+
+fn bench_element_access(c: &mut Criterion) {}
+
 criterion_group!(
     forward_multi_thread,
     bench_forward_multi_thread55,
@@ -370,5 +368,5 @@ criterion_group!(
     bench_forward_multi_thread11
 );
 criterion_group!(multi_thread, bench_alloc_mt, bench_free_mt);
-criterion_group!(mono_thread, bench_alloc, bench_free);
+criterion_group!(mono_thread, bench_alloc_recycle, bench_alloc, bench_free,);
 criterion_main!(mono_thread, multi_thread, forward_multi_thread);
