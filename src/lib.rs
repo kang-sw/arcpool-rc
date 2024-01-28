@@ -6,3 +6,6 @@ mod detail;
 pub use api::*;
 
 // TODO: ArcSwap RefCnt adapter
+
+#[cold]
+fn cold_path() {}

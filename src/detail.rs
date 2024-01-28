@@ -1074,7 +1074,7 @@ impl<T: 'static> Slot<T> {
         // non-intrusive manner.
 
         fn check_incr_fn(strong: u32) -> Option<u32> {
-            if strong == 0 {
+            if strong == 0 || strong == u32::MAX {
                 return None;
             }
 
@@ -1171,3 +1171,7 @@ impl<T> Slot<T> {
         (this as *mut MaybeUninit<Self>).sub(index_offset as _) as _
     }
 }
+
+// ========================================================== Container for Slot ===|
+
+mod slot;
