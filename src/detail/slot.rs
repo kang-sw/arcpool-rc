@@ -2,7 +2,7 @@ use std::{
     ptr::{null_mut, NonNull},
     sync::atomic::{
         AtomicPtr, AtomicUsize,
-        Ordering::{Acquire, Relaxed, Release, SeqCst},
+        Ordering::{Acquire, Relaxed, Release},
     },
 };
 
@@ -12,7 +12,7 @@ use super::Slot;
 pub(super) struct Table<T> {
     pop_index: AtomicUsize,
     push_index: AtomicUsize,
-    elems: [AtomicPtr<Slot<T>>; 14],
+    elems: [AtomicPtr<Slot<T>>; 6],
 }
 
 impl<T> Default for Table<T> {
@@ -43,10 +43,7 @@ impl<T> Table<T> {
         let tail = tail.unwrap_or(&mut *elem) as *mut Slot<T>;
         debug_assert!((*tail).next_free.is_null());
 
-        let push_index = self.push_index.fetch_add(1, Relaxed);
-
-        let index = push_index % self.elems.len();
-        let socket = &self.elems[index];
+        let mut push_index = self.push_index.fetch_sub(1, Relaxed);
 
         // - Set order should be Release, to make `next_free` visible to other thread.
         // - We won't care the fetch order
@@ -61,17 +58,19 @@ impl<T> Table<T> {
             Some(elem)
         };
 
-        // We're going to spin in busy loop before starting yielding
-        let mut spin_count = 0_usize;
+        loop {
+            let index = push_index % self.elems.len();
+            let socket = &self.elems[index];
 
-        while socket.fetch_update(SeqCst, Relaxed, update_func).is_err() {
-            spin_count += 1;
-
-            if spin_count < 10 {
-                std::hint::spin_loop();
-            } else {
-                std::thread::yield_now();
+            if socket.fetch_update(Release, Relaxed, update_func).is_ok() {
+                return;
             }
+
+            // If we fail to push element, rotate slot to push by 1.
+            push_index = push_index.wrapping_add(1);
+
+            // We're spinning now!
+            std::hint::spin_loop();
         }
     }
 
@@ -86,9 +85,7 @@ impl<T> Table<T> {
         while tried_bits != 0 {
             let index = pop_index % self.elems.len();
             pop_index = pop_index.wrapping_add(5);
-            // ^^^^^^ Adding 5 is same as above context, to prevent contension between threads as
-            // much as possible; This allows 5 concurrent tasks rotate without contension at least
-            // for 3 tries.
+            //                                ^^^ This will reduce consumer collision.
 
             let socket = &self.elems[index];
 
@@ -147,5 +144,9 @@ impl<T> Table<T> {
         }
 
         None
+    }
+
+    pub const fn num_slots(&self) -> usize {
+        self.elems.len()
     }
 }

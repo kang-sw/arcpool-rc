@@ -303,12 +303,12 @@ struct PoolInnerImpl<T, CreateFn, PrepareFn, CleanFn, Counter, AllocLock> {
     //   - A can detect this; (cache invalidated!)
     //   - But, other thread still tries to access already allocated node 2.
     //   - Need to avoid this situation ... but, how?
-    free_head: slot::Table<T>,
+    free_head: CachePadded<slot::Table<T>>,
 
     /// If only the strong reference was released (in sync) (i.e. any weak reference presents),
     /// the node will be stored here. Only `sync` checkouts are allowed to access this storage,
     /// as the generation based hot reuse is exclusively permitted for atomic versions.
-    free_head_may_weak: slot::Table<T>,
+    free_head_may_weak: CachePadded<slot::Table<T>>,
 
     fallback_page_size: NonZeroUsize,
 
