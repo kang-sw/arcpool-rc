@@ -105,6 +105,7 @@ unsafe impl<T: Send + Sync> Sync for WeakPoolItem<T> {}
 
 // ==== Impls ====
 
+/// Provide default implementation as `expired` default pointer.
 impl<T: 'static> Default for WeakPoolItem<T> {
     fn default() -> Self {
         Self {
@@ -172,7 +173,7 @@ impl<T> std::ops::Deref for PoolItem<T> {
 impl<T> Drop for WeakPoolItem<T> {
     fn drop(&mut self) {
         if let Some(slot) = self.slot {
-            Slot::release(slot)
+            Slot::weak_release(slot)
         }
     }
 }

@@ -657,6 +657,10 @@ impl<T: 'static> Slot<T> {
         }
 
         this.owner().local_slot_checkin_then_dispose(p_this);
+
+        // NOTE: There MUST be no any subsequence interaction with `this` or `this_ptr` here since
+        // it will remove the owner's reference if it was the last reference that was holding the
+        // owner, which invalidates EVERY data related to this method.
     }
 
     // ==== Sync API ====
@@ -740,8 +744,26 @@ impl<T: 'static> Slot<T> {
         Some(this_ptr)
     }
 
-    pub fn weak_release(this: NonNull<Self>) {
-        todo!()
+    pub fn weak_release(this_ptr: NonNull<Self>) {
+        let this = Self::access(&this_ptr);
+
+        // Decrement weak reference count. If it's not zero, it's just okay to return.
+        let prev_weak = unsafe { this.atomic_weak() }.fetch_sub(1, Ordering::Release);
+
+        if prev_weak > 1 {
+            return;
+        }
+
+        // This represents the last weak reference. Given that the count never drops to zero as long as there is
+        // any strong reference present, it can be concluded that at this point, no strong references are alive.
+        debug_assert!(unsafe { this.atomic_strong() }.load(Ordering::Acquire) == 0);
+
+        // Now we can safely dispose this slot.
+        this.owner().sync_slot_dispose(this_ptr);
+
+        // NOTE: There MUST be no any subsequence interaction with `this` or `this_ptr` here since
+        // it will remove the owner's reference if it was the last reference that was holding the
+        // owner, which invalidates EVERY data related to this method.
     }
 
     pub fn upgrade(this: NonNull<Self>, gen: u32) -> bool {
