@@ -29,6 +29,10 @@ macro_rules! pull_forward_ {
     ($pool:ident, 3) => {
         $pool.clone().create_owned().unwrap()
     };
+
+    ($pool:ident, 4_sync) => {
+        $pool.checkout()
+    };
 }
 
 #[macro_export]

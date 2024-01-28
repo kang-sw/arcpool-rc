@@ -27,12 +27,25 @@ impl sharded_slab::Clear for Vec4096 {
     fn clear(&mut self) {}
 }
 
+#[derive(Clone)]
+struct BigElem {
+    _inner: [u8; 128],
+}
+
+impl Default for BigElem {
+    fn default() -> Self {
+        Self { _inner: [0; 128] }
+    }
+}
+
 fn bench_alloc(c: &mut Criterion) {
     let mut group = c.benchmark_group("allocation");
     bench_alloc_impl_!(
         group,
         "arcpool sync mode",
-        arcpool::Pool::<Vec<u8>>::builder().finish(),
+        arcpool::Pool::<Vec<u8>>::builder()
+            .with_initializer(|| Vec::<u8>::with_capacity(16 * 1024))
+            .finish(),
         4_sync
     );
     bench_alloc_impl_!(
@@ -87,6 +100,14 @@ fn bench_free(c: &mut Criterion) {
     let mut group = c.benchmark_group("free");
     bench_free_impl_!(
         group,
+        "arcpool sync mode",
+        arcpool::Pool::<Vec<u8>>::builder()
+            .with_initializer(|| Vec::<u8>::with_capacity(16 * 1024))
+            .finish(),
+        4_sync
+    );
+    bench_free_impl_!(
+        group,
         "none object poll",
         lockfree_object_pool::NoneObjectPool::new(|| Vec::<u8>::with_capacity(16 * 1024)),
         1
@@ -137,6 +158,23 @@ fn bench_alloc_mt(c: &mut Criterion) {
     let mut group = c.benchmark_group("multi thread allocation");
     bench_alloc_mt_impl_!(
         group,
+        "arcpool sync mode",
+        arcpool::Pool::<Vec<u8>>::builder()
+            .with_initializer(|| Vec::<u8>::with_capacity(16 * 1024))
+            .finish(),
+        4_sync
+    );
+    bench_alloc_mt_impl_!(
+        group,
+        "arcpool sync mode with lock config",
+        arcpool::Pool::<Vec<u8>>::builder()
+            .with_initializer(|| Vec::<u8>::with_capacity(16 * 1024))
+            .with_page_allocation_lock(true)
+            .finish(),
+        4_sync
+    );
+    bench_alloc_mt_impl_!(
+        group,
         "none object poll",
         lockfree_object_pool::NoneObjectPool::new(|| Vec::<u8>::with_capacity(16 * 1024)),
         1
@@ -185,6 +223,14 @@ fn bench_alloc_mt(c: &mut Criterion) {
 
 fn bench_free_mt(c: &mut Criterion) {
     let mut group = c.benchmark_group("multi thread free");
+    bench_free_mt_impl_!(
+        group,
+        "arcpool sync mode",
+        arcpool::Pool::<Vec<u8>>::builder()
+            .with_initializer(|| Vec::<u8>::with_capacity(16 * 1024))
+            .finish(),
+        4_sync
+    );
     bench_free_mt_impl_!(
         group,
         "none object poll",
@@ -238,6 +284,16 @@ fn bench_forward_multi_thread(c: &mut Criterion, nb_writter: usize, nb_readder: 
         "forward msg from pull (nb_writter:{} nb_readder:{})",
         nb_writter, nb_readder
     ));
+    bench_forward_impl_!(
+        group,
+        "arcpool sync mode",
+        arcpool::Pool::<Vec<u8>>::builder()
+            .with_initializer(|| Vec::<u8>::with_capacity(16 * 1024))
+            .finish(),
+        nb_readder,
+        nb_writter,
+        4_sync
+    );
     bench_forward_impl_!(
         group,
         "none object poll",
