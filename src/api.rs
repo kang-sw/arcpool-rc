@@ -1,5 +1,5 @@
 use std::{
-    num::{NonZeroU16, NonZeroUsize},
+    num::NonZeroUsize,
     ptr::NonNull,
     sync::{Arc, Weak},
 };
@@ -105,9 +105,18 @@ unsafe impl<T: Send + Sync> Sync for WeakPoolItem<T> {}
 
 // ==== Impls ====
 
+impl<T: 'static> Default for WeakPoolItem<T> {
+    fn default() -> Self {
+        Self {
+            slot: None,
+            gen: u32::MAX,
+        }
+    }
+}
+
 impl<T: 'static + Send + Sync> PoolItem<T> {
-    /// Tries to retrieve mutable reference of pulled object. It returns valid object only when
-    /// the
+    /// Tries to retrieve mutable reference of pulled object. It returns valid object only when this
+    /// handle is solely unique reference (including weak) for inner value.
     pub fn try_get_mut(&self) -> Option<&mut T> {
         todo!()
     }
@@ -141,7 +150,7 @@ impl<T: 'static + Send + Sync> Clone for WeakPoolItem<T> {
             // reference repeatedly, which simply delays release of reusable memory space.
             slot: self
                 .slot
-                .and_then(|slot| Slot::weak_add_ref(slot, self.gen)),
+                .and_then(|slot| Slot::try_clone_weak(slot, self.gen)),
         }
     }
 }
@@ -171,13 +180,15 @@ impl<T> Drop for WeakPoolItem<T> {
 // ========================================================== Local Pool Item ===|
 
 /// Pool item for non-sync items.
+///
+/// This handle works same way with [`std::rc::Rc`].
 pub struct LocalPoolItem<T> {
     slot: NonNull<Slot<T>>,
 }
 
 /// Pool item for non-sync items.
 pub struct WeakLocalPoolItem<T> {
-    slot: NonNull<Slot<T>>,
+    slot: Option<NonNull<Slot<T>>>,
 }
 
 // ========================================================== *Partial* API ===|
