@@ -32,14 +32,21 @@ where
         T: Send + Sync,
     {
         PoolItem {
-            slot: self.inner.checkout(),
+            slot: self.inner.checkout_sync(),
         }
     }
 
-    /// Allocate new item from pool as local object. It can hold non-send, non-sync object
-    /// inside, and uses optimized intrinsics on cloning handles. (i.e. works as
-    /// [`std::rc::Rc`] instead of [`std::sync::Arc`])
-    pub fn checkout_local(&self) -> LocalPoolItem<T> {
+    /// Allocate a new item from the pool as a local object. This object can contain non-send,
+    /// non-sync elements, and utilizes optimized intrinsics for cloning handles. (i.e., it
+    /// functions like [`std::rc::Rc`] instead of [`std::sync::Arc`]).
+    ///
+    /// Although it returns a non-send, non-sync handle for the checked-out value, the inner value
+    /// must be marked as [`Send`]. This is because, after checkout, the object will not be dropped
+    /// but recycled, and it may be checked out again from a different thread.
+    pub fn checkout_local(&self) -> LocalPoolItem<T>
+    where
+        T: Send,
+    {
         LocalPoolItem {
             slot: self.inner.checkout_local(),
         }
@@ -163,12 +170,12 @@ impl<T> Drop for WeakPoolItem<T> {
 
 // ========================================================== Local Pool Item ===|
 
-/// Pool item for non-send items.
+/// Pool item for non-sync items.
 pub struct LocalPoolItem<T> {
     slot: NonNull<Slot<T>>,
 }
 
-/// Pool item for non-weak items.
+/// Pool item for non-sync items.
 pub struct WeakLocalPoolItem<T> {
     slot: NonNull<Slot<T>>,
 }
