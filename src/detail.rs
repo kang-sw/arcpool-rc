@@ -9,6 +9,7 @@ use std::{
 };
 
 use parking_lot::Mutex;
+use static_assertions::const_assert;
 
 pub(crate) mod pool {
     #[derive(Default)]
@@ -796,11 +797,16 @@ impl<T: 'static> Slot<T> {
         unsafe { this.as_mut() }
     }
 
-    fn header(&self) -> NonNull<PageHeader<T>> {
-        todo!()
-    }
-
     fn owner(&self) -> &dyn PoolInner<T> {
-        todo!()
+        let this_addr = self as *const _ as *const MaybeUninit<Self>;
+        let header_addr = unsafe { this_addr.sub(self.index_offset as _) };
+
+        debug_assert!(self.index_offset >= 1);
+
+        // SAFETY: index_offset is set on slot init, and never get changed over time.
+        let header = unsafe { &*(header_addr as *const PageHeader<T>) };
+
+        // SAFETY: as long as we can access any slot, the owner reference never dangle.
+        unsafe { header.owner.as_ref() }
     }
 }
