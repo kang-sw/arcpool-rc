@@ -15,6 +15,7 @@ const ROTATE_AMOUNT: usize = 5;
 pub(super) struct Table<T> {
     pop_index: AtomicUsize,
     push_index: AtomicUsize,
+    padding: [usize; 14 - HEAD_SOCKET_COUNT],
     elems: [AtomicPtr<Slot<T>>; HEAD_SOCKET_COUNT],
 }
 
@@ -23,6 +24,7 @@ impl<T> Default for Table<T> {
         Self {
             pop_index: Default::default(),
             push_index: Default::default(),
+            padding: Default::default(),
             elems: Default::default(),
         }
     }

@@ -45,7 +45,7 @@ fn at_size(b: &mut Criterion, nsample: usize) {
         });
     });
 
-    const NTHREAD: usize = 8;
+    const NTHREAD: usize = 16;
 
     group.bench_function("mt/arcpool", |b| {
         b.iter_custom(|iter| {
