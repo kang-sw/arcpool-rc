@@ -4,3 +4,5 @@ pub mod unsafe_ref_cell;
 mod detail;
 
 pub use api::*;
+
+// TODO: ArcSwap RefCnt adapter

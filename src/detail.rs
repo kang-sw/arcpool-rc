@@ -3,13 +3,12 @@ use std::{
     num::NonZeroUsize,
     ptr::{null_mut, NonNull},
     sync::{
-        atomic::{self, AtomicU32, Ordering},
+        atomic::{AtomicU32, Ordering},
         Arc,
     },
 };
 
 use parking_lot::Mutex;
-use static_assertions::const_assert;
 
 pub(crate) mod pool {
     #[derive(Default)]
@@ -60,10 +59,10 @@ pub(crate) trait PoolInner<T>: Send + Sync + 'static {
     fn num_total_items(&self) -> Option<usize>;
     fn num_free_items(&self) -> Option<usize>;
 
-    fn sync_slot_cleanup_then_checkin(&self, ptr: NonNull<Slot<T>>);
-    fn sync_slot_dispose(&self, ptr: NonNull<Slot<T>>);
-    fn local_slot_cleanup(&self, ptr: NonNull<Slot<T>>);
-    fn local_slot_checkin_then_dispose(&self, ptr: NonNull<Slot<T>>);
+    fn sync_slot_cleanup_then_checkin(&self, slot_ref: &mut Slot<T>);
+    fn sync_slot_dispose(&self, slot_ref: &mut Slot<T>);
+    fn local_slot_cleanup(&self, slot_ref: &mut Slot<T>);
+    fn local_slot_checkin_then_dispose(&self, slot_ref: &mut Slot<T>);
 }
 
 // ========================================================== Pool Inner Impl ===|
@@ -146,8 +145,8 @@ struct PageHeader<T> {
     /// Original buffer, **_contains_** `self` at start.
     raw_buffer: NonNull<[MaybeUninit<Slot<T>>]>,
 
-    /// `raw_buffer[payload_start_at..]` is content.
-    payload_start_at: u32,
+    /// `raw_buffer[payload_start_index..]` is content.
+    payload_start_index: u32,
 
     /// Only referred during entire pool destruction. When it reaches == `page_length`, the
     /// entire page will be deallocated.
@@ -234,16 +233,40 @@ where
         self.item_counter.free_item()
     }
 
-    fn sync_slot_cleanup_then_checkin(&self, ptr: NonNull<Slot<T>>) {
+    fn sync_slot_cleanup_then_checkin(&self, slot_ref: &mut Slot<T>) {
         self.item_counter.inc_free_item_by(1);
+
+        debug_assert!(unsafe { slot_ref.atomic_strong().load(Ordering::Relaxed) == 0 });
+
+        // Increment generation as early as possible. This expires every other weak references
+        // referring to this version of strong reference.
+        slot_ref.generation.fetch_add(1, Ordering::Release);
 
         // Will increment generation by 1 if it has any alive weak reference(except this).
         // Otherwise, generation is reset to 0 and pushed to total free list.
 
-        todo!("All strong reference released")
+        // Cleanup inner data
+        self.clean_func.call(&mut slot_ref.value);
+
+        // Check if this is the sole reference remaining including entire weak references.
+        let last_weak_ref = unsafe { slot_ref.atomic_weak() }.fetch_sub(1, Ordering::Acquire) == 1;
+
+        if !last_weak_ref {
+            // put it back to free_head_with_ref
+            push_slot(&self.free_head_may_weak, slot_ref.into());
+        } else {
+            // put it back to free_head
+            push_slot(&self.free_head, slot_ref.into());
+
+            self.sync_slot_dispose(slot_ref);
+        }
+
+        // NOTE: EXTRA CAUTION HERE; since THIS line, any interaction with `self` or `slot_ref` must
+        // not occured anymore since it'll dispose `self` inside if this was the last reference to
+        // the pool, which may invalidate all the references that we're accessing from here.
     }
 
-    fn local_slot_cleanup(&self, ptr: NonNull<Slot<T>>) {
+    fn local_slot_cleanup(&self, slot_ref: &mut Slot<T>) {
         self.item_counter.inc_free_item_by(1);
 
         // TODO: Sync memory barrier of weak, strong count.
@@ -251,13 +274,21 @@ where
         todo!()
     }
 
-    fn sync_slot_dispose(&self, ptr: NonNull<Slot<T>>) {
-        // TODO: Decrement self's reference count.
+    fn sync_slot_dispose(&self, _slot_ref: &mut Slot<T>) {
+        // It could be disposed during it's still inside of the free queue list. Therefore, we can't
+        // assert that any of strong and weak reference count would be zero.
+        //
+        //      debug_assert!(unsafe { slot_ref.atomic_strong().load(Ordering::Relaxed) == 0 });
+        //      debug_assert!(unsafe { slot_ref.atomic_weak().load(Ordering::Relaxed) == 0 });
+        //
+        // Therefore, the only thing that we have to do here is just decrementing reference count of
+        // self. This may drop the entire pool if it was the last reference.
 
-        todo!("Slot is completely freed")
+        // SAFETY: self is originally was `Arc`
+        drop(unsafe { Arc::from_raw(self as *const _) });
     }
 
-    fn local_slot_checkin_then_dispose(&self, ptr: NonNull<Slot<T>>) {
+    fn local_slot_checkin_then_dispose(&self, slot_ref: &mut Slot<T>) {
         // TODO: Decrement self's reference count.
 
         // Prepare to put this node to free stack.
@@ -314,20 +345,13 @@ where
             has_weak || (slot.weak_count == 0 && slot.generation.load(Ordering::Relaxed) == 0)
         );
 
-        // Before giving it a strong reference count, increment generation by 1 whether it has weak
-        // reference or not. (it'll be 1 if there was no weak references)
-        //
-        // Memory order should be `release`, since if any expired weak reference present and it
-        // observes the strong reference count existance before the generation value change is
-        // observed, it will be upgraded to invalid strong reference.
-
         // SAFETY: `weak_count` is guaranteed accessed as atomic as long as `has_weak` is true.
         let no_alive_weak_ref =
             !has_weak || (unsafe { slot.atomic_weak().fetch_add(1, Ordering::Acquire) } == 0);
         //                ^^^ `has_weak` set to true if we fetched this entity from
         //                `free_head_may_weak`, however, as its name implies, the dangling weak
         //                reference possibly be resolved while it is free. Therefore, it's better to
-        //                double-check if this reference actually *has weak* count as advertised.
+        //                double-check if this reference actually has *weak count* as advertised.
 
         if no_alive_weak_ref {
             // We have exclusive
@@ -348,11 +372,9 @@ where
             // side to notify weak handles expiration as soon as possible, to not make pointless
             // weak references repeatedly.
 
-            slot.strong_count = 1; // It's okay to accessing it via non-atomic way, as the expired
-                                   // weak reference won't care the strong count value if generation
-                                   // value mismatches. Therefore the only guarantee that we should
-                                   // provide is generation is modified *before* strong count become
-                                   // any non-zero value, which is accomplished by `AcqRel` ordering
+            // We need to access the strong count atomically, since the expired weak reference would
+            // try upgrading (even it's invalid) to strong reference
+            unsafe { slot.atomic_strong() }.store(1, Ordering::Relaxed);
 
             // We don't increment reference count of `self` here; since previous weak reference
             // count was non-zero, which means the previous strong count increment is still
@@ -453,7 +475,7 @@ where
             // SAFETY: We'll never mutably access owner.
             owner: unsafe { NonNull::new_unchecked(transmute(self_dyn)) },
             raw_buffer,
-            payload_start_at: payload_offset as _,
+            payload_start_index: payload_offset as _,
             dealloc_counter: elem_count as _,
         };
 
@@ -548,8 +570,11 @@ impl<T, CreateFn, PrepareFn, CleanFn, Counter, AllocLock> Drop
 // ========================================================== Slot Logics ===|
 
 /// A container for single value.
+#[repr(C)] // Slot can directly be converted from the address of value `T`.
 pub(crate) struct Slot<T> {
     value: T,
+
+    /// Nearlest free item that this slot is pointing to.
     next_free: *mut Slot<T>,
 
     /// # Concept of Generation and Weak Count
@@ -633,7 +658,8 @@ impl<T: 'static> Slot<T> {
         }
 
         // In local mode, strong reference disposal only cleans up the slot, not freeing.
-        this.owner().local_slot_cleanup(p_this);
+        this.owner()
+            .local_slot_cleanup(Self::access_mut(&mut { p_this }));
 
         // Decrement single weak reference initially incurred by strong references.
         Self::weak_release_local(p_this);
@@ -657,14 +683,23 @@ impl<T: 'static> Slot<T> {
             return;
         }
 
-        this.owner().local_slot_checkin_then_dispose(p_this);
+        this.owner()
+            .local_slot_checkin_then_dispose(Self::access_mut(&mut { p_this }));
 
-        // NOTE: There MUST be no any subsequence interaction with `this` or `this_ptr` here since
+        // NOTE: There MUST be no more subsequent interaction with `this` or `this_ptr` here since
         // it will remove the owner's reference if it was the last reference that was holding the
         // owner, which invalidates EVERY data related to this method.
     }
 
-    // ==== Sync API ====
+    pub fn try_upgrade_local(this_ptr: NonNull<Self>) -> Option<NonNull<Self>> {
+        todo!()
+    }
+
+    pub fn downgrade_local(this_ptr: NonNull<Self>) {
+        todo!()
+    }
+
+    // ========================================================== Sync API ===|
 
     #[inline]
     pub fn add_ref(this: NonNull<Self>)
@@ -687,6 +722,7 @@ impl<T: 'static> Slot<T> {
 
     #[inline]
     pub fn release(this_ptr: NonNull<Self>) {
+        let mut this_ptr_b = this_ptr; // Just workaround to avoid borrow checker complaint
         let this = Self::access(&this_ptr);
         let prev_strong = unsafe { this.atomic_strong() }.fetch_sub(1, Ordering::Release);
 
@@ -699,10 +735,8 @@ impl<T: 'static> Slot<T> {
         // that no other weak reference can upgrade this handle to valid strong reference.
 
         // In sync mode, slot is checked in even if there's alive weak handles out there.
-        this.owner().sync_slot_cleanup_then_checkin(this_ptr);
-
-        // Then release
-        Self::weak_release(this_ptr)
+        this.owner()
+            .sync_slot_cleanup_then_checkin(Self::access_mut(&mut this_ptr_b));
     }
 
     /// Adding ref does not care whether
@@ -745,8 +779,8 @@ impl<T: 'static> Slot<T> {
         Some(this_ptr)
     }
 
-    pub fn weak_release(this_ptr: NonNull<Self>) {
-        let this = Self::access(&this_ptr);
+    pub fn weak_release(mut this_ptr: NonNull<Self>) {
+        let this = Self::access_mut(&mut this_ptr);
 
         // Decrement weak reference count. If it's not zero, it's just okay to return.
         let prev_weak = unsafe { this.atomic_weak() }.fetch_sub(1, Ordering::Release);
@@ -760,27 +794,99 @@ impl<T: 'static> Slot<T> {
         debug_assert!(unsafe { this.atomic_strong() }.load(Ordering::Acquire) == 0);
 
         // Now we can safely dispose this slot.
-        this.owner().sync_slot_dispose(this_ptr);
+        this.owner().sync_slot_dispose(this);
 
-        // NOTE: There MUST be no any subsequence interaction with `this` or `this_ptr` here since
+        // NOTE: There MUST be no more subsequent interaction with `this` or `this_ptr` here since
         // it will remove the owner's reference if it was the last reference that was holding the
         // owner, which invalidates EVERY data related to this method.
     }
 
-    pub fn upgrade(this: NonNull<Self>, gen: u32) -> bool {
-        todo!()
+    pub fn try_upgrade(this_ptr: NonNull<Self>, gen: u32) -> Option<NonNull<Self>> {
+        // 1. Check if strong-count is nonzero
+        // 2. Create upgraded reference preemptively
+        // 3. Check generation is valid
+        //   3. 1. Drops if it was invalid generation
+        //
+        // It's just okay to create falsy strong reference since:
+        // - As long as there's alive weak reference, the generation will keep incrementing; i.e.
+        //   won't collide practically in short-term.
+        // - Regardless if it's same reference that was originally subscribing or not, cloning
+        //   existing reference is defined operation, and disposing it is defined either. Even at
+        //   worst case, it's just checking out object from different thread, which is valid
+        //   operation as long as the user used the pool in safe way.
+
+        let this = Self::access(&this_ptr);
+        let strong_count = unsafe { this.atomic_strong() };
+
+        // We need to repeat since other thread may intercept our trial to increment strong count in
+        // non-intrusive manner.
+
+        fn check_incr_fn(strong: u32) -> Option<u32> {
+            if strong == 0 {
+                return None;
+            }
+
+            // Just check if it doesn't overflow.
+            assert!(strong < u32::MAX);
+
+            Some(strong + 1)
+        }
+
+        if strong_count
+            .fetch_update(Ordering::Release, Ordering::Relaxed, check_incr_fn)
+            .is_err()
+        {
+            // It simply failed to upgrade to valid strong reference.
+            return None;
+        }
+
+        // Now we have valid strong reference. Check if generation is valid.
+
+        if this.generation.load(Ordering::Acquire) != gen {
+            // Since we've upgraded wrong reference, release it.
+            // - In most cases, it'll just decrement the strong reference count of slot.
+            // - At some edge case, this release would checkin the slot as last strong reference,
+            //   which is just okay since it never exits sync mode as long as there's remaining weak
+            //   reference.
+            Self::release(this_ptr);
+            None
+        } else {
+            // Okay, we've got valid strong reference. Return it to user.
+            Some(this_ptr)
+        }
     }
 
-    pub fn downgrade(this: NonNull<Self>) -> u32 {
-        todo!()
+    /// Returns generation
+    pub fn downgrade(this_ptr: NonNull<Self>) -> u32 {
+        let this = Self::access(&this_ptr);
+
+        // Increment weak refernce count preemptively. It's okay to be just release, as it never
+        // drops below 1 since this has strong reference.
+        unsafe { this.atomic_weak() }.fetch_add(1, Ordering::Relaxed);
+
+        // Before releasing strong reference, retrive current generation value.
+        let gen = this.generation.load(Ordering::Relaxed);
+
+        // Now we can safely release the strong reference.
+        Self::release(this_ptr);
+
+        gen
     }
 
+    #[inline(always)]
     pub fn deref<'a>(this: NonNull<Self>) -> &'a T {
-        todo!()
+        unsafe { &this.as_ref().value }
     }
 
-    pub fn try_mut<'a>(this: NonNull<Self>) -> Option<&'a mut T> {
-        todo!()
+    pub fn try_mut<'a>(this_ptr: NonNull<Self>) -> Option<&'a mut T> {
+        let this = Self::access(&this_ptr);
+
+        // To return mutable reference correctly, we need to check if it's truly unique reference.
+        unsafe {
+            (this.atomic_strong().load(Ordering::Relaxed) == 1
+                && this.atomic_weak().load(Ordering::Relaxed) == 1)
+                .then(|| &mut (*this_ptr.as_ptr()).value)
+        }
     }
 
     // ==== Accessors ====
@@ -797,7 +903,7 @@ impl<T: 'static> Slot<T> {
         unsafe { this.as_mut() }
     }
 
-    fn owner(&self) -> &dyn PoolInner<T> {
+    fn owner(&self) -> &'static dyn PoolInner<T> {
         let this_addr = self as *const _ as *const MaybeUninit<Self>;
         let header_addr = unsafe { this_addr.sub(self.index_offset as _) };
 
@@ -808,5 +914,12 @@ impl<T: 'static> Slot<T> {
 
         // SAFETY: as long as we can access any slot, the owner reference never dangle.
         unsafe { header.owner.as_ref() }
+    }
+
+    pub fn get_owner_arc(this: NonNull<Self>) -> Arc<dyn PoolInner<T>> {
+        let this = Self::access(&this);
+
+        unsafe { Arc::from_raw(this.owner()) }.clone()
+        // 										   ^^^ `from_raw` won't increment strong ref!
     }
 }

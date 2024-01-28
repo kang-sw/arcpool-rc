@@ -26,7 +26,8 @@ where
 
     /// Allocate new item from pool. If no free slot presents, new page will be allocated.
     ///
-    /// The returned item will automatically be checked in when dropped.
+    /// The returned item will automatically be checked in when dropped. The returned item is not
+    /// guaranteed to be unique reference which can be accessed through [`PoolItem::get_mut`].
     pub fn checkout(&self) -> PoolItem<T>
     where
         T: Send + Sync,
@@ -43,6 +44,9 @@ where
     /// Although it returns a non-send, non-sync handle for the checked-out value, the inner value
     /// must be marked as [`Send`]. This is because, after checkout, the object will not be dropped
     /// but recycled, and it may be checked out again from a different thread.
+    ///
+    /// The returned item is guaranteed to be unique reference, that initial call to
+    /// [`LocalPoolItem::get_mut`] always succeed.
     pub fn checkout_local(&self) -> LocalPoolItem<T>
     where
         T: Send,
@@ -66,6 +70,7 @@ where
         self.inner.allocate_page(page_size.try_into().ok());
     }
 
+    /// Downgrade to weak pool reference.
     pub fn downgrade(&self) -> WeakPool<T> {
         WeakPool {
             inner: Arc::downgrade(&self.inner),
@@ -73,6 +78,7 @@ where
     }
 }
 
+/// Upgrade to weak pool reference.
 impl<T> WeakPool<T>
 where
     T: 'static,
@@ -118,18 +124,27 @@ impl<T: 'static> Default for WeakPoolItem<T> {
 impl<T: 'static + Send + Sync> PoolItem<T> {
     /// Tries to retrieve mutable reference of pulled object. It returns valid object only when this
     /// handle is solely unique reference (including weak) for inner value.
-    pub fn try_get_mut(&self) -> Option<&mut T> {
-        todo!()
+    pub fn get_mut(&self) -> Option<&mut T> {
+        Slot::try_mut(self.slot)
     }
 
     pub fn downgrade(&self) -> WeakPoolItem<T> {
-        todo!()
+        WeakPoolItem {
+            gen: Slot::downgrade(self.slot),
+            slot: Some(self.slot),
+        }
+    }
+
+    pub fn owner(&self) -> Pool<T> {
+        Pool {
+            inner: Slot::get_owner_arc(self.slot),
+        }
     }
 }
 
 impl<T: 'static + Send + Sync> WeakPoolItem<T> {
-    pub fn upgrade(&self) -> PoolItem<T> {
-        todo!()
+    pub fn upgrade(&self) -> Option<PoolItem<T>> {
+        Slot::try_upgrade(self.slot?, self.gen).map(|slot| PoolItem { slot })
     }
 }
 
