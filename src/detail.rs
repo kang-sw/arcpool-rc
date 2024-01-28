@@ -759,9 +759,7 @@ impl<T, CreateFn, PrepareFn, CleanFn, Counter, AllocLock> Drop
     for PoolInnerImpl<T, CreateFn, PrepareFn, CleanFn, Counter, AllocLock>
 {
     fn drop(&mut self) {
-        // TODO
-
-        // In this context, EVERY strong reference to pool is dropped. This indicates:
+        // In this context, EVERY strong reference to the pool is dropped. This indicates:
         //
         // - Every handles to `Pool<T>` was dropped.
         // - Every slots of EVERY page was freed.
@@ -773,7 +771,39 @@ impl<T, CreateFn, PrepareFn, CleanFn, Counter, AllocLock> Drop
         // Therefore, we can safely assume that this is the only thread which accesses every
         // element of all items
 
-        todo!()
+        let track_release_fn = |mut slot: *mut Slot<T>| unsafe {
+            while !slot.is_null() {
+                // First retrieve owning page header and next node of this slot.
+                let head = Slot::get_header_ptr(slot);
+                let next = (*slot).next_free;
+
+                debug_assert!((*slot).strong_count == 0);
+                debug_assert!((*slot).weak_count == 0);
+                debug_assert!((*slot).generation.load(Ordering::Relaxed) == 0);
+
+                // Then manually destroy the slot since it was originally `MaybeUnitit`.
+                slot.drop_in_place();
+
+                // Then, decrement deallocation counter of the page header.
+                (*head).dealloc_counter -= 1;
+
+                if (*head).dealloc_counter == 0 {
+                    // We can safely dispose this page, since all of the node included in this page
+                    // was deallocated.
+
+                    let raw_buffer = (*head).raw_buffer;
+                    head.drop_in_place();
+
+                    // Finally, we need to deallocate the buffer
+                    drop(Box::from_raw(raw_buffer.as_ptr()))
+                }
+
+                slot = next;
+            }
+        };
+
+        track_release_fn(*self.free_head.lock());
+        track_release_fn(*self.free_head_may_weak.lock());
     }
 }
 
@@ -1127,5 +1157,12 @@ impl<T: 'static> Slot<T> {
 
         unsafe { Arc::from_raw(this.owner()) }.clone()
         // 										   ^^^ `from_raw` won't increment strong ref!
+    }
+}
+
+impl<T> Slot<T> {
+    unsafe fn get_header_ptr(this: *mut Self) -> *mut PageHeader<T> {
+        let index_offset = (*this).index_offset;
+        (this as *mut MaybeUninit<Self>).sub(index_offset as _) as _
     }
 }
