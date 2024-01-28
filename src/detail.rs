@@ -21,7 +21,7 @@ pub(crate) mod pool {
 
     use parking_lot::Mutex;
 
-    use super::{Counter, FnApply, FnCreate, PageLock, PoolInnerImpl, Slot};
+    use super::{Counter, FnApply, FnCreate, PageLock, PoolInnerImpl};
 
     #[derive(Default)]
     pub struct Builder<T, CreateFn, PrepareFn, CleanFn> {
@@ -1107,11 +1107,6 @@ impl<T: 'static> Slot<T> {
 
         // Before releasing strong reference, retrive current generation value.
         this.generation.load(Ordering::Relaxed)
-    }
-
-    #[inline(always)]
-    pub fn deref<'a>(this: NonNull<Self>) -> &'a T {
-        unsafe { &this.as_ref().value }
     }
 
     pub fn try_mut<'a>(this_ptr: NonNull<Self>) -> Option<&'a mut T> {

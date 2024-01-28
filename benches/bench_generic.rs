@@ -36,6 +36,13 @@ macro_rules! pull_forward_ {
 }
 
 #[macro_export]
+macro_rules! deref_ {
+    ($item:ident, $_:tt) => {
+        $item
+    };
+}
+
+#[macro_export]
 macro_rules! bench_alloc_impl_ {
     ($group:expr, $name:literal, $expression:expr, $pull_impl:tt) => {
         $group.bench_function($name, |b| {

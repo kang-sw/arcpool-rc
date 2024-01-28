@@ -188,7 +188,8 @@ impl<T> std::ops::Deref for PoolItem<T> {
     type Target = T;
 
     fn deref(&self) -> &Self::Target {
-        Slot::deref(self.slot)
+        // The value is laid directly upon the slot.
+        unsafe { &*(self.slot.as_ptr() as *const T) }
     }
 }
 
