@@ -534,6 +534,15 @@ unsafe fn try_pop_slot<T>(head: &Mutex<*mut Slot<T>>) -> Option<NonNull<Slot<T>>
 }
 
 fn push_slot<T>(head: &Mutex<*mut Slot<T>>, mut slot: NonNull<Slot<T>>) {
+    // TEMPORARY
+
+    // unsafe {
+    //     slot.as_mut().next_free = *head.data_ptr();
+    //     (*head.data_ptr()) = slot.as_ptr();
+
+    //     return;
+    // }
+
     let mut head = head.lock();
 
     // Next element MUST be free

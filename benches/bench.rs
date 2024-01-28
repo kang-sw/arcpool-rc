@@ -19,7 +19,7 @@ struct AllocBenchElem {
 impl Default for AllocBenchElem {
     fn default() -> Self {
         Self {
-            _data: Vec::with_capacity(4096),
+            _data: Vec::with_capacity(16384),
         }
     }
 }
@@ -359,7 +359,7 @@ fn bench_forward_multi_thread11(c: &mut Criterion) {
 
 // ========================================================== Dereference Benchmark ===|
 
-#[derive(Default)]
+#[derive(Default, Clone)]
 struct ElemAccessBenchArg {
     value: u64,
 }
@@ -398,6 +398,33 @@ fn bench_element_access(c: &mut Criterion, n: usize) {
             });
         };
     }
+
+    group.bench_function("crate 'hecs'", |b| {
+        let mut pool = hecs::World::new();
+
+        let mut items = Vec::new();
+        let mut rand = rand::rngs::StdRng::from_seed([0; 32]);
+
+        for _ in 0..n {
+            items.push(pool.spawn((ElemAccessBenchArg::default(),)));
+        }
+
+        let mut query = pool.query::<&ElemAccessBenchArg>();
+        let view = query.view();
+
+        b.iter(|| {
+            let pos1 = rand.gen_range(0..n);
+            let item1 = &items[pos1];
+            let item2 = &items[items.len() - pos1 - 1];
+
+            // Don't let the random generation be significant factor
+            for _ in 0..10000 {
+                std::hint::black_box(
+                    view.get(*item1).unwrap().value + view.get(*item2).unwrap().value,
+                );
+            }
+        })
+    });
 
     bench_element_access_impl_!(
         group,
@@ -489,8 +516,8 @@ criterion_group!(
 criterion_group!(multi_thread, bench_alloc_mt, bench_free_mt);
 criterion_group!(mono_thread, bench_alloc_recycle, bench_alloc, bench_free,);
 criterion_main!(
-    element_access,
     mono_thread,
+    element_access,
     multi_thread,
     forward_multi_thread
 );

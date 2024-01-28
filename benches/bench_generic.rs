@@ -18,6 +18,20 @@ macro_rules! pull_ {
     ($pool:ident, 4_local) => {
         $pool.checkout_local()
     };
+    ($pool:ident, 4_local) => {
+        $pool.checkout_local()
+    };
+}
+
+#[macro_export]
+macro_rules! deref_ {
+    ($item:ident, $_:tt) => {
+        $item
+    };
+
+    ($item:ident, $_:tt) => {
+        $item
+    };
 }
 
 #[macro_export]
@@ -32,13 +46,6 @@ macro_rules! pull_forward_ {
 
     ($pool:ident, 4_sync) => {
         $pool.checkout()
-    };
-}
-
-#[macro_export]
-macro_rules! deref_ {
-    ($item:ident, $_:tt) => {
-        $item
     };
 }
 
@@ -61,41 +68,21 @@ macro_rules! bench_recycle_alloc_impl_ {
         $group.bench_function($name, |b| {
             let pool = $expression;
             let mut items = Vec::new();
-            b.iter_custom(|iter| {
-                let start_at = std::time::Instant::now();
 
-                for n in 0..iter {
-                    match n % 1000 {
-                        0..=149 => {
+            b.iter(|| {
+                for n in 0..100 {
+                    match n {
+                        0..=24 | 50..=74 => {
                             items.push(pull_!(pool, $pull_impl));
                         }
 
-                        150..=199 => {
-                            items.swap_remove(9989 % items.len());
-                        }
-
-                        200..=399 => {
-                            items.push(pull_!(pool, $pull_impl));
-                        }
-
-                        400..=649 => {
-                            items.swap_remove(9989 % items.len());
-                        }
-
-                        650..=799 => {
-                            items.push(pull_!(pool, $pull_impl));
-                        }
-
-                        800..=999 => {
-                            items.swap_remove(9989 % items.len());
+                        25..=49 | 75..=99 => {
+                            items.swap_remove(rand::random::<usize>() % items.len());
                         }
 
                         _ => unreachable!(),
                     }
-                    items.push(pull_!(pool, $pull_impl));
                 }
-
-                start_at.elapsed()
             });
         });
     };

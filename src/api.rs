@@ -187,6 +187,7 @@ impl<T> Drop for PoolItem<T> {
 impl<T> std::ops::Deref for PoolItem<T> {
     type Target = T;
 
+    #[inline(always)]
     fn deref(&self) -> &Self::Target {
         // The value is laid directly upon the slot.
         unsafe { &*(self.slot.as_ptr() as *const T) }

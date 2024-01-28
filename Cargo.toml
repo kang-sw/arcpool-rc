@@ -21,6 +21,8 @@ object-pool = "0.5"
 criterion = "0.5.1"
 criterion-plot = "0.5"
 lockfree-object-pool = "0.1"
+rand = "0.8"
+hecs = "0.10"
 
 [[bench]]
 name = "bench"
