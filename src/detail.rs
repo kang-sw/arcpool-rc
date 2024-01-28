@@ -8,6 +8,7 @@ use std::{
     },
 };
 
+use crossbeam_utils::CachePadded;
 use parking_lot::Mutex;
 
 pub(crate) mod pool {
@@ -68,8 +69,8 @@ pub(crate) mod pool {
 
         fn finish_with<C: Counter, L: PageLock>(self, counter: C, lock: L) -> crate::Pool<T> {
             let inner = Arc::new(PoolInnerImpl {
-                free_head: Mutex::new(null_mut()),
-                free_head_may_weak: Mutex::new(null_mut()),
+                free_head: Mutex::new(null_mut()).into(),
+                free_head_may_weak: Mutex::new(null_mut()).into(),
                 fallback_page_size: self.page_size.try_into().unwrap(),
                 init_func: self.init_func,
                 prepare_func: self.prepare_func,
@@ -302,12 +303,12 @@ struct PoolInnerImpl<T, CreateFn, PrepareFn, CleanFn, Counter, AllocLock> {
     //   - A can detect this; (cache invalidated!)
     //   - But, other thread still tries to access already allocated node 2.
     //   - Need to avoid this situation ... but, how?
-    free_head: Mutex<*mut Slot<T>>,
+    free_head: CachePadded<Mutex<*mut Slot<T>>>,
 
     /// If only the strong reference was released (in sync) (i.e. any weak reference presents),
     /// the node will be stored here. Only `sync` checkouts are allowed to access this storage,
     /// as the generation based hot reuse is exclusively permitted for atomic versions.
-    free_head_may_weak: Mutex<*mut Slot<T>>,
+    free_head_may_weak: CachePadded<Mutex<*mut Slot<T>>>,
 
     fallback_page_size: NonZeroUsize,
 

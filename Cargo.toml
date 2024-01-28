@@ -2,13 +2,13 @@
 name = "arcpool"
 version = "0.1.0"
 edition = "2021"
-license = "MIT"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
 parking_lot = "0.12.1"
 static_assertions = "1.1.0"
+crossbeam-utils = "0.8"
 
 [features]
 force-safe-api = []
@@ -26,4 +26,8 @@ hecs = "0.10"
 
 [[bench]]
 name = "bench"
+harness = false
+
+[[bench]]
+name = "poc"
 harness = false
