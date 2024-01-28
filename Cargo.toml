@@ -12,3 +12,16 @@ static_assertions = "1.1.0"
 
 [features]
 force-safe-api = []
+
+
+# Dependencies for benchmark suite
+[dev-dependencies]
+sharded-slab = "0.1"
+object-pool = "0.5"
+criterion = "0.5.1"
+criterion-plot = "0.5"
+lockfree-object-pool = "0.1"
+
+[[bench]]
+name = "bench"
+harness = false

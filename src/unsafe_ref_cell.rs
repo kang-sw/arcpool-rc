@@ -31,7 +31,9 @@ impl<T> UnsafeRefCell<T> {
     pub fn new(inner: T) -> Self {
         Self {
             inner: UnsafeCell::new(inner),
+            #[cfg(any(debug_assertions, feature = "force-safe-api"))]
             borrow_count: AtomicUsize::new(0),
+            #[cfg(any(debug_assertions, feature = "force-safe-api"))]
             borrow_mut_count: AtomicUsize::new(0),
         }
     }
