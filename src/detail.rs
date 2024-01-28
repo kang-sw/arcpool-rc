@@ -11,6 +11,8 @@ use std::{
 use crossbeam_utils::CachePadded;
 use parking_lot::Mutex;
 
+use crate::detail::slot::HEAD_SOCKET_COUNT;
+
 pub(crate) mod pool {
     use std::{
         ptr::null_mut,
@@ -716,23 +718,6 @@ where
         // - Last element's `next_free`, MUST point to actually valid argument.
         // - And this step MUST not interfere `checkin` operations from different threads.
 
-        // SAFETY: 1. Initialized, 2. Payload array length never be zero.
-        let (first_ptr, last_elem) = unsafe {
-            (
-                payload_slice
-                    .first_mut()
-                    .unwrap_unchecked()
-                    .assume_init_mut() as *mut _,
-                payload_slice
-                    .last_mut()
-                    .unwrap_unchecked()
-                    .assume_init_mut(),
-            )
-        };
-
-        // The last element currently pointing invalid pointer address ... Clear it.
-        last_elem.next_free = null_mut();
-
         // Preemptively increment both the total and free counts here. It's particularly
         // important to increment the free count before inserting a new page into the stack, as
         // failing to do so could reduce the free count below zero, potentially causing a panic
@@ -743,8 +728,19 @@ where
         self.item_counter.inc_total_by(elem_count);
         self.item_counter.inc_free_item_by(elem_count);
 
-        // Prepend the whole page allocation to existing free head stack.
-        unsafe { self.free_head.push(first_ptr, Some(last_elem)) };
+        // Split payload slice as chunks, and distribute new allocation as fair as possible.
+        let chunk_size = (elem_count / HEAD_SOCKET_COUNT).max(1);
+
+        unsafe {
+            for chunk in payload_slice.chunks_mut(chunk_size) {
+                let (first, rest) = chunk.split_first_mut().unwrap();
+                let first_elem = first.assume_init_mut();
+                let last_elem = rest.last_mut().unwrap().assume_init_mut();
+                last_elem.next_free = null_mut();
+
+                self.free_head.push(first_elem, Some(last_elem))
+            }
+        }
     }
 }
 

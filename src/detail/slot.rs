@@ -8,11 +8,14 @@ use std::{
 
 use super::Slot;
 
+pub(super) const HEAD_SOCKET_COUNT: usize = 6;
+const ROTATE_AMOUNT: usize = 5;
+
 #[repr(C)]
 pub(super) struct Table<T> {
     pop_index: AtomicUsize,
     push_index: AtomicUsize,
-    elems: [AtomicPtr<Slot<T>>; 6],
+    elems: [AtomicPtr<Slot<T>>; HEAD_SOCKET_COUNT],
 }
 
 impl<T> Default for Table<T> {
@@ -84,7 +87,7 @@ impl<T> Table<T> {
 
         while tried_bits != 0 {
             let index = pop_index % self.elems.len();
-            pop_index = pop_index.wrapping_add(5);
+            pop_index = pop_index.wrapping_add(ROTATE_AMOUNT);
             //                                ^^^ This will reduce consumer collision.
 
             let socket = &self.elems[index];
@@ -144,9 +147,5 @@ impl<T> Table<T> {
         }
 
         None
-    }
-
-    pub const fn num_slots(&self) -> usize {
-        self.elems.len()
     }
 }

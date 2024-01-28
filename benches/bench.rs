@@ -507,17 +507,12 @@ criterion_group!(
     bench_forward_multi_thread51,
     bench_forward_multi_thread11
 );
-criterion_group!(
-    element_access,
-    bench_element_access128,
-    bench_element_access1024,
-    bench_element_access16384
-);
+criterion_group!(element_access, bench_element_access1024,);
 criterion_group!(multi_thread, bench_alloc_mt, bench_free_mt);
 criterion_group!(mono_thread, bench_alloc_recycle, bench_alloc, bench_free,);
 criterion_main!(
     mono_thread,
-    element_access,
     multi_thread,
-    forward_multi_thread
+    forward_multi_thread,
+    element_access,
 );
