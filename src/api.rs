@@ -1,3 +1,5 @@
+// - TODO: Performance improvement. (Single checkout without contention takes ~120ns, too big ..)
+
 use std::{
     num::NonZeroUsize,
     ptr::NonNull,
@@ -32,6 +34,18 @@ where
             slot: self.inner.checkout_sync(),
         }
     }
+
+    // TODO: Add new method
+    //
+    //      fn checkout_mutable(&self) -> MutPoolItem<T>
+    //
+    // - Right after checkout, it's valid to mutate returned reference since expired weak reference
+    //   can't upgraded to strong reference.
+    // - However `PoolItem::get_mut` won't work when there's any expired weak reference, since it
+    //   cannot distinguish whether how many weak reference is currently *expired*
+    // - Therefore, we need to add new method which returns `MutPoolItem` which can be used to
+    //   forcibly notify that this item is *fresh* and it's okay to mutate. It should be non-clone,
+    //   and only be able to *frozen* into `PoolItem` by user.
 
     /// Allocate a new item from the pool as a local object. This object can contain non-send,
     /// non-sync elements, and utilizes optimized intrinsics for cloning handles. (i.e., it
